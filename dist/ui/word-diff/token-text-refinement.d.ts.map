@@ -1,0 +1,1 @@
+{"version":3,"file":"token-text-refinement.d.ts","sourceRoot":"","sources":["../../../src/ui/word-diff/token-text-refinement.ts"],"names":[],"mappings":"AAUA,OAAO,EAIL,KAAK,iBAAiB,EACvB,MAAM,aAAa,CAAC;AACrB,OAAO,KAAK,EAAE,gBAAgB,EAAE,MAAM,YAAY,CAAC;AAcnD,wBAAgB,sBAAsB,CACpC,WAAW,EAAE,iBAAiB,EAC9B,UAAU,EAAE,iBAAiB,GAC5B,gBAAgB,GAAG,SAAS,CAgB9B"}

@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../../src/residency/pi-entry.ts"],
+  "sourcesContent": ["import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";\r\nimport { runResidentHostFromConfigPath } from \"./host.js\";\r\n\r\nconst configPath = process.env.PI_FABRIC_RESIDENT_CONFIG;\r\n\r\nexport default function (pi: ExtensionAPI): void {\r\n  let controller: AbortController | undefined;\r\n  let host: Promise<void> | undefined;\r\n\r\n  pi.on(\"session_start\", (_event, ctx) => {\r\n    if (host) return;\r\n    if (!configPath) {\r\n      ctx.shutdown();\r\n      return;\r\n    }\r\n    controller = new AbortController();\r\n    host = runResidentHostFromConfigPath(configPath, controller.signal)\r\n      .catch(() => undefined)\r\n      .finally(() => ctx.shutdown());\r\n  });\r\n\r\n  pi.on(\"session_shutdown\", () => controller?.abort());\r\n}\r\n"],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;AAGA,IAAM,aAAa,QAAQ,IAAI;AAEhB,SAAR,iBAAkB,IAAwB;AAC/C,MAAI;AACJ,MAAI;AAEJ,KAAG,GAAG,iBAAiB,CAAC,QAAQ,QAAQ;AACtC,QAAI,KAAM;AACV,QAAI,CAAC,YAAY;AACf,UAAI,SAAS;AACb;AAAA,IACF;AACA,iBAAa,IAAI,gBAAgB;AACjC,WAAO,8BAA8B,YAAY,WAAW,MAAM,EAC/D,MAAM,MAAM,MAAS,EACrB,QAAQ,MAAM,IAAI,SAAS,CAAC;AAAA,EACjC,CAAC;AAED,KAAG,GAAG,oBAAoB,MAAM,YAAY,MAAM,CAAC;AACrD;",
+  "names": []
+}

@@ -1,0 +1,1 @@
+{"version":3,"file":"fabric-exec-arguments.d.ts","sourceRoot":"","sources":["../src/fabric-exec-arguments.ts"],"names":[],"mappings":"AA0DA,eAAO,MAAM,yBAAyB,GAAI,QAAQ;IAChD,QAAQ,CAAC,EAAE,OAAO,CAAC;IACnB,OAAO,CAAC,EAAE,OAAO,CAAC;CACnB,KAAG,MAAM,CAAC,MAAM,EAAE,MAAM,CAAC,GAAG,SAC8D,CAAC;AAE5F,eAAO,MAAM,0BAA0B,GAAI,OAAO,OAAO,KAAG,OA4C3D,CAAC"}

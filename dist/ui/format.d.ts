@@ -1,0 +1,9 @@
+export declare const safeText: (value: unknown) => string;
+export declare const formatActorDataPreview: (data: unknown, maxChars?: number) => string | undefined;
+export declare const formatDuration: (milliseconds: number) => string;
+export declare const formatTokens: (tokens: number) => string;
+export declare const formatCost: (usd: number) => string;
+export declare const formatClock: (timestamp: number) => string;
+export declare const padToWidth: (value: string, width: number) => string;
+export declare const wrapPlainText: (value: string, width: number, maxLines?: number) => string[];
+//# sourceMappingURL=format.d.ts.map

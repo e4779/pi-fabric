@@ -1,0 +1,1 @@
+{"version":3,"file":"semaphore.d.ts","sourceRoot":"","sources":["../../src/agents/semaphore.ts"],"names":[],"mappings":"AAOA,qBAAa,SAAS;;IAIR,QAAQ,CAAC,KAAK,EAAE,MAAM;gBAAb,KAAK,EAAE,MAAM;IAIlC,OAAO,CAAC,MAAM,CAAC,EAAE,WAAW,GAAG,OAAO,CAAC,MAAM,IAAI,CAAC;CAyCnD"}

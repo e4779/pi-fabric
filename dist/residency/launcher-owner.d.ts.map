@@ -1,0 +1,1 @@
+{"version":3,"file":"launcher-owner.d.ts","sourceRoot":"","sources":["../../src/residency/launcher-owner.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,wBAAwB;IACvC,OAAO,EAAE,OAAO,CAAC;IACjB,aAAa,EAAE,OAAO,CAAC;IACvB,UAAU,EAAE,OAAO,CAAC;CACrB;AAED,wBAAgB,oBAAoB,CAClC,QAAQ,EAAE,MAAM,GAAG,SAAS,EAC5B,QAAQ,EAAE,MAAM,GAAG,SAAS,EAC5B,OAAO,EAAE,OAAO,GACf,wBAAwB,CAW1B"}

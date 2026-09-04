@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../../src/ref-names.ts"],
+  "sourcesContent": ["// Identifier-safe shape used by the QuickJS `mcp.<server>.<tool>` proxy, the\r\n// rendered advisory refs, and the generated guest type declarations. Shared so\r\n// the provider, the advisory adapter, the declaration renderer, and the\r\n// transcript ash-replay all agree on how a raw name appears in code. Kept\r\n// dependency-free so runtime declaration builders and host providers can both\r\n// import it without pulling in provider dependency graphs.\r\nexport const sanitizeMcpRefPart = (value: string): string => {\r\n  const sanitized = value.replace(/[^A-Za-z0-9_$]/g, \"_\");\r\n  return /^[A-Za-z_$]/.test(sanitized) ? sanitized : `_${sanitized}`;\r\n};\r\n"],
+  "mappings": ";AAMO,IAAM,qBAAqB,CAAC,UAA0B;AAC3D,QAAM,YAAY,MAAM,QAAQ,mBAAmB,GAAG;AACtD,SAAO,cAAc,KAAK,SAAS,IAAI,YAAY,IAAI,SAAS;AAClE;",
+  "names": []
+}

@@ -1,0 +1,1 @@
+{"version":3,"file":"dynamic-border.d.ts","sourceRoot":"","sources":["../../src/ui/dynamic-border.ts"],"names":[],"mappings":"AAKA,MAAM,MAAM,kBAAkB,GAAG,CAAC,IAAI,EAAE,MAAM,KAAK,MAAM,CAAC;AAE1D,qBAAa,aAAa;;gBAGZ,KAAK,GAAE,kBAAyC;IAI5D,UAAU,IAAI,IAAI;IAIlB,MAAM,CAAC,KAAK,EAAE,MAAM,GAAG,MAAM,EAAE;CAGhC"}

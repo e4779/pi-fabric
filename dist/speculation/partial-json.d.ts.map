@@ -1,0 +1,1 @@
+{"version":3,"file":"partial-json.d.ts","sourceRoot":"","sources":["../../src/speculation/partial-json.ts"],"names":[],"mappings":"AAmBA,qBAAa,yBAAyB;;gBASxB,QAAQ,EAAE,MAAM;IAI5B,IAAI,QAAQ,IAAI,OAAO,CAEtB;IAED,0EAA0E;IAC1E,IAAI,IAAI,IAAI,MAAM,GAAG,SAAS,CAE7B;IAED,IAAI,CAAC,KAAK,EAAE,MAAM,GAAG,IAAI;CAwD1B"}
