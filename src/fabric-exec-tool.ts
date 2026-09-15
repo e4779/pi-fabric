@@ -18,6 +18,7 @@ import {
 } from "./ui/code-preview-shell.js";
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import { Type } from "typebox";
+import { FabricRepeatGuard } from "./repeat-guard.js";
 import {
   createFabricPersistedExecutionDetails,
   readFabricExecutionRenderDetails,
@@ -130,6 +131,8 @@ const compactResultHeader = (
 const countLabel = (count: number, singular: string): string =>
   `${count} ${count === 1 ? singular : `${singular}s`}`;
 
+const FABRIC_REPEAT_WARN = 3;
+const FABRIC_REPEAT_BLOCK = 6;
 export const createFabricExecTool = (
   state: FabricState,
   codePreviewSettings: CodePreviewSettings,
@@ -139,6 +142,7 @@ export const createFabricExecTool = (
 ): ToolDefinition<any, any, any> => {
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
+  const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
   return decorateShell(
   defineTool({
     name: "fabric_exec",
@@ -825,7 +829,15 @@ export const createFabricExecTool = (
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
-      const runDisplay = normalizeRunDisplay(params.display);
+      // Degenerate-loop circuit breaker: identical code back-to-back (display
+      // and payload cosmetics excluded) gets warned, then blocked.
+      const repeat = repeatGuard.observe(code);
+      if (repeat.blocked) {
+        return {
+          content: [{ type: "text", text: `Circuit breaker: this exact fabric_exec code has now executed ${repeat.count} times in a row and was blocked. Re-running identical code adds no information. Summarize what you already know and finish your turn; if the call is genuinely required, change the code materially.` }],
+          isError: true,
+        };
+      }
       const strings = resolveFabricExecPayloads(params);
       const tokenBudget = "tokenBudget" in params && typeof params.tokenBudget === "number"
         ? params.tokenBudget : undefined;
@@ -879,6 +891,9 @@ export const createFabricExecTool = (
       if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
       if (result.error) fullSections.push(`Runtime error: ${result.error}`);
       if (failureProgress) fullSections.push(failureProgress);
+      if (repeat.warn) {
+        fullSections.push(`[circuit-breaker] identical fabric_exec code has now run ${repeat.count} times in a row; at ${FABRIC_REPEAT_BLOCK} identical runs will be blocked. Change the approach or finish your turn.`);
+      }
       const fullRawOutput = fullSections.join("\n\n");
       const outputBudget = modelOutputBudget(
         state.config.executor.maxOutputChars,
