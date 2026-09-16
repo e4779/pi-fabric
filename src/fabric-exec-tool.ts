@@ -836,6 +836,7 @@ export const createFabricExecTool = (
         return {
           content: [{ type: "text", text: `Circuit breaker: this exact fabric_exec code has now executed ${repeat.count} times in a row and was blocked. Re-running identical code adds no information. Summarize what you already know and finish your turn; if the call is genuinely required, change the code materially.` }],
           isError: true,
+          details: undefined,
         };
       }
       const strings = resolveFabricExecPayloads(params);
@@ -850,14 +851,6 @@ export const createFabricExecTool = (
         ...(tokenBudget !== undefined ? { tokenBudget } : {}),
         ...(params.agentBudget !== undefined ? { maxAgentCalls: params.agentBudget } : {}),
         ...(params.timeoutMs !== undefined ? { requestedTimeoutMs: params.timeoutMs } : {}),
-        ...(runDisplay
-          ? {
-              display: {
-                ...(runDisplay.name !== undefined && { name: runDisplay.name }),
-                ...(runDisplay.description !== undefined && { description: runDisplay.description }),
-              },
-            }
-          : {}),
         onPartial(snapshot) {
           onUpdate?.({
             content: [{ type: "text", text: snapshot.progress ?? "" }],
