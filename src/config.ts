@@ -53,6 +53,12 @@ interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
   cpython: { binary: string };
+  /** Optional jev-fabric backend for durable tasks and sessions (macOS/Linux).
+   * `binary` empty or "auto" picks the user's compatible install outside the
+   * workspace, then the bundled package; an explicit path never falls back.
+   * `home` empty means JEV_FABRIC_HOME, else `<cwd>/.jev-fabric-native`, the
+   * same store other harnesses share. `timeoutMs` is the default job lifetime. */
+  jevFabric: { binary: string; home: string; timeoutMs: number };
   /** TypeScript backend only; ignored by the Python kernel. */
   runtime: FabricExecutorRuntime;
   timeoutMs: number;
@@ -105,8 +111,19 @@ export interface FabricMcpJevConfig {
   semanticMinProbability: number;
 }
 
+const nativeMcpServersValue = (value: unknown): string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 256 || value.some(name =>
+    typeof name !== "string" || !/^[A-Za-z0-9_-]+$/.test(name.trim()))) {
+    throw new Error("mcp.nativeServers must be an array of at most 256 exact Pi MCP server names (letters, digits, _ and -)");
+  }
+  return [...new Set(value.map((name: string) => name.trim()))];
+};
+
 export interface FabricMcpConfig {
   enabled: boolean;
+  /** Opt-in exact server names owned by Pi, never mcporter fallback targets. */
+  nativeServers?: string[];
   configPath?: string;
   disableOAuth: boolean;
   allowDynamicServers: boolean;
@@ -384,6 +401,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     kernel: "typescript",
     pythonRuntime: "monty",
     cpython: { binary: "python3" },
+    jevFabric: { binary: "", home: "", timeoutMs: 3_600_000 },
     runtime: "quickjs",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
@@ -403,6 +421,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mcp: {
     enabled: true,
+    nativeServers: [],
     disableOAuth: true,
     allowDynamicServers: true,
     callTimeoutMs: 120_000,
@@ -753,6 +772,7 @@ const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefi
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
+  const jevFabric = objectValue(executor.jevFabric);
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
     executor.maxTimeoutMs,
@@ -890,6 +910,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       cpython: {
         binary: stringValue(cpython.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.cpython.binary,
       },
+      jevFabric: {
+        binary: stringValue(jevFabric.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.jevFabric.binary,
+        home: stringValue(jevFabric.home)?.trim() ?? "",
+        timeoutMs: boundedInteger(jevFabric.timeoutMs, DEFAULT_FABRIC_CONFIG.executor.jevFabric.timeoutMs, 1_000, MAX_EXECUTOR_TIMEOUT_MS),
+      },
       runtime: executorRuntime,
       maxTimeoutMs: boundedInteger(
         executor.maxTimeoutMs,
@@ -953,6 +978,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     mcp: {
       enabled: booleanValue(mcp.enabled, DEFAULT_FABRIC_CONFIG.mcp.enabled),
+      nativeServers: nativeMcpServersValue(mcp.nativeServers),
       ...(configPath ? { configPath } : {}),
       disableOAuth: booleanValue(mcp.disableOAuth, DEFAULT_FABRIC_CONFIG.mcp.disableOAuth),
       allowDynamicServers: booleanValue(
@@ -1576,6 +1602,9 @@ export const saveFabricConfig = (
   const input = readJsonObjectFile(targetPath);
   const existing = migrateFabricConfigDocument(input?.document ?? {}).document;
   const merged = mergeObjects(existing, partial) as Record<string, unknown>;
+  // Reject invalid ownership before the settings UI replaces a working file.
+  // Do not normalize the whole document: saved layers must remain sparse.
+  nativeMcpServersValue(objectValue(merged.mcp).nativeServers);
   // Never stamp down: preserve version markers written by newer builds.
   merged.configVersion = Math.max(
     typeof merged.configVersion === "number" ? merged.configVersion : 0,

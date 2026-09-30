@@ -125,6 +125,8 @@ import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
+import { readFabricBashMiddleware } from "./core/shell-middleware.js";
+import { DurableShellBridge } from "./jev-fabric/bridge.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
 import { RESIDENT_HOST_FORMAT, residentRoot } from "./residency/protocol.js";
@@ -378,6 +380,15 @@ export class FabricRuntimeState {
       agentDir: resolveAgentDir(),
       projectTrusted,
     });
+    if (!this.#managedHost && process.platform !== "win32") {
+      this.#shellJobs.durable = new DurableShellBridge(this.#shellJobs, {
+        cwd: context.cwd,
+        agentDir: resolveAgentDir(),
+        ownerId: context.sessionManager?.getSessionId?.(),
+        settings: () => (this.#config ?? DEFAULT_FABRIC_CONFIG).executor.jevFabric,
+        middleware: () => readFabricBashMiddleware(this.capturedTools.get("bash")?.definition),
+      });
+    }
     this.#registry = new ActionRegistry(
       new FabricToolResultProxy(() => this.capturedTools.runner),
     );
@@ -385,6 +396,7 @@ export class FabricRuntimeState {
     this.#unsubscribeCapturedCatalog?.();
     this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() => {
       this.#registry?.notifyCatalogChanged("extensions");
+      if (this.#config?.mcp.nativeServers?.length) this.#registry?.notifyCatalogChanged("mcp");
       this.#refreshRepairCatalog();
     });
     this.#componentSupervisor = new FabricComponentSupervisor(this.#registry, {
@@ -880,6 +892,7 @@ export class FabricRuntimeState {
               },
             },
             authorize: (ref, parentToolCallId) => this.#schema!.authorize(ref, parentToolCallId),
+            jevFabric: this.#shellJobs.durable,
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.

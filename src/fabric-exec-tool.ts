@@ -1,3 +1,4 @@
+import { fabricToolLoadout } from "./core/tool-ownership.js";
 import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@earendil-works/pi-ai";
 import { Container, Text, type Component } from "@earendil-works/pi-tui";
@@ -150,6 +151,14 @@ export const createFabricExecTool = (
   return decorateShell(
   defineTool({
     name: "fabric_exec",
+    // Native codemode-only hides direct tools. An orchestrator must stay model-only.
+    exposure: "model-only",
+    prepareLoadout: (loadout) => {
+      // SDK/CLI reload rebuilds the registry before session_start bootstraps
+      // the replacement extension. That transient loadout is not a request.
+      if (!state.bootstrapped) return undefined;
+      return fabricToolLoadout(loadout, state.config.fullCodeMode || state.config.schema.mode === "enforce");
+    },
     label: "Fabric",
     description: python
       ? monty
