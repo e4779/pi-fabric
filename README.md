@@ -76,11 +76,15 @@ Pi's native MCP can optionally supply selected servers beneath the same Fabric A
 
 ## Install
 
-Requires Node.js 24+ and Pi 0.99.0+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric warns when a detectable host is older than the required native loadout and nested-execution contracts.
+Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric warns when a detectable host is older than the required native loadout and nested-execution contracts.
+
+**0.103.1: Pi 1.0 compatibility.** Full-code and Schema enforce loadouts own declarations through native `prepareLoadout`, including built-in codemode, tool search, MCP, late activation, and reload. Captured dispatch and core overrides retain native middleware; capture patches restore on the final shutdown lease without recursive wrapping. Run `bun run test:pi1` for public-contract, compiled SDK, and bundled-CLI regressions. Optional/audit mode retains the host loadout.
+
+**0.103.0: daemon primitives.** Headless, restart-safe sessions get small composable building blocks: a [runner contract](docs/agents.md#custom-runners) with hosted runs that persist a locator before start and never relaunch (`pi-fabric/runners`); durable [decisions](docs/decisions.md) with escalation chains, headless approvals, and routed child dialogs; mesh timers, scoped external grants, and the `pi-fabric` CLI; [saved programs](docs/programs.md) with host-invoked runs; host-issued principal and scope (`pi-fabric/scope`) that children only narrow; write confinement, context-inheriting spawn, and worktree results; provider participants, a foreground-tool policy, compaction pressure and carry-forward focus, [thinking control](docs/thinking.md), heartbeat liveness across PID namespaces, and incarnation-fenced control commands. New behavior is opt-in or additive. A configured `agents.runner` id that no extension registers is kept and warned about once per session, without falling back to `pi`.
 
 **0.102.0: opt-in Pi-owned MCP.** Select native servers with `mcp.nativeServers` while keeping Fabric's API, policy pipeline, names/descriptions, and result normalization. Existing defaults remain unchanged. Native identities are indexed by registration snapshot, with live exposure and schema checks; SDK reload and settings-save guards are included.
 
-**0.101.1: Pi 0.99 compatibility.** Full-code and Schema enforce modes declare only `fabric_exec`, including with native codemode, tool search, MCP, late registrations, and active-tool changes. Captured tools remain available as `extensions.<name>(...)` inside Fabric, with host middleware applied. Pi packages and TypeBox are host-supplied peers, never bundled. Run `bun run test:pi99` for the offline compiled-extension SDK and bundled-CLI regression. The same compiled package also passes an isolated Pi 0.99.1 SDK/CLI gate; development pins remain 0.99.0.
+**0.101.1: Pi 0.99 compatibility.** Full-code and Schema enforce modes declare only `fabric_exec`, including with native codemode, tool search, MCP, late registrations, and active-tool changes. Captured tools remain available as `extensions.<name>(...)` inside Fabric, with host middleware applied. Pi packages and TypeBox are host-supplied peers, never bundled. The same compiled package also passes an isolated Pi 0.99.1 SDK/CLI gate; development pins at that release were 0.99.0.
 
 ```bash
 pi install npm:pi-fabric
@@ -98,8 +102,8 @@ pi install git:github.com/monotykamary/pi-fabric
 From a local checkout:
 
 ```bash
-pnpm install
-pnpm build
+bun install
+bun run build
 pi install /absolute/path/to/pi-fabric
 ```
 
@@ -128,6 +132,7 @@ Pi loads advanced patterns after direct user invocation. Run `/skill:fabric-guid
 | Multi-model compare-not-merge deliberation or act mode | `/skill:fabric-fusion Deliberate this design across models.` |
 | One command that chooses advisor or supervisor | `/skill:fabric-ambient advisor Focus on migration correctness.` |
 | A durable team coordinating through versioned tasks | `/skill:fabric-swarm Coordinate this migration across owned task partitions.` |
+| A step graph that survives restarts, with human approval nodes | `/skill:fabric-graph Run fetch, test, and an approval gate before release as a resumable graph.` |
 | Evidence-gated edits with postconditions | `/skill:fabric-schema Make this parser change only if focused tests stay green.` |
 | Typed semantic judgments or bounded reactive loops | `/skill:fabric-jev Build a ticket triage loop with an explicit review path and evaluation budget.` |
 
@@ -154,6 +159,10 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, and budgets.
 - [Execution kernels](docs/kernels.md): exclusive TypeScript/Python selection, Monty sandboxing, CPython escape hatch, agent inheritance, and examples.
 - [Prompt cache](docs/prompt-cache.md): honest cache observations and optional, time-bounded native warming leases.
+- [Thinking control](docs/thinking.md): scoped host-session reasoning effort with configured bounds that children inherit and never widen.
+- [Optional durable Pi runner](docs/durable-pi.md): explicit hosted-backend registration, persistent submissions, recovery boundaries, and unchanged default runner behavior.
+- [Durable decisions](docs/decisions.md): pending approvals and questions in the project mesh, headless approvals, routed child dialogs, `/fabric decisions`, and the `pi-fabric decisions` CLI.
+- [Saved programs](docs/programs.md): content-addressed programs, nested `programs.run` with the caller's capabilities, `/fabric programs`, and host runs through `/fabric run` or an event.
 - [Memory & recall](docs/memory-recall.md): compact ranked hits, uniform follow calls, lossless expansion, and guest-local `memory.walk` computation.
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
 - [Agents, actors & mesh](docs/agents.md): model handoff, `/fabric prewalk`, runners, transports, actors, councils, recursive queries, and durable coordination.
@@ -173,10 +182,10 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 ## Development
 
 ```bash
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm build
+bun install
+bun run check:fast
+bun run test:smoke
+bun run build
 ```
 
 The test suite covers:

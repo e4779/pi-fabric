@@ -1,6 +1,7 @@
 import type { AgentRunRequest } from "./types.js";
-import { isFabricThinking } from "../thinking.js";
+import { isFabricThinking, normalizeThinkingBounds } from "../thinking.js";
 import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
+import { isFabricRunnerId } from "./runner-registry.js";
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
 const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
@@ -37,15 +38,18 @@ export const normalizeAgentRunRequest = (
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
-  const runner =
-    args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-      ? args.runner
-      : defaults.runner;
+  if (args.runner !== undefined && !isFabricRunnerId(args.runner)) {
+    throw new Error(`Invalid Fabric agent runner: ${JSON.stringify(args.runner)}`);
+  }
+  const runner = args.runner ?? defaults.runner;
   const inheritedModel =
     runner === "pi" && !defaults.model && defaults.inheritedModel
       ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}`
       : undefined;
   const kernel = checkedKernel(args.kernel);
+  const thinkingBounds = args.thinkingBounds === undefined
+    ? undefined
+    : normalizeThinkingBounds(args.thinkingBounds, "thinkingBounds");
   if (args.recursive === true && args.extensions === false) {
     throw new Error("Recursive Fabric requires extensions enabled; omit recursive or extensions: false");
   }
@@ -64,6 +68,7 @@ export const normalizeAgentRunRequest = (
       ? { persona: args.persona.trim() }
       : {}),
     ...(thinking ? { thinking } : {}),
+    ...(thinkingBounds ? { thinkingBounds } : {}),
     ...(tools ? { tools } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean"
@@ -72,6 +77,12 @@ export const normalizeAgentRunRequest = (
     ...(typeof args.recursive === "boolean" ? { recursive: args.recursive } : {}),
     ...(options.allowCwd !== false && typeof args.cwd === "string" ? { cwd: args.cwd } : {}),
     ...(typeof args.worktree === "boolean" ? { worktree: args.worktree } : {}),
+    ...(args.worktreeSetup !== undefined ? { worktreeSetup: args.worktreeSetup as string } : {}),
+    // Shapes are checked fail-closed by the manager before launch.
+    ...(args.readOnly !== undefined ? { readOnly: args.readOnly as boolean } : {}),
+    ...(args.writableRoots !== undefined ? { writableRoots: args.writableRoots as string[] } : {}),
+    ...(args.shell !== undefined ? { shell: args.shell as "deny" | "unconfined" } : {}),
+    ...(args.scope !== undefined ? { scope: args.scope as NonNullable<AgentRunRequest["scope"]> } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
       : {}),

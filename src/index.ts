@@ -47,20 +47,25 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerCompactionHook } from "./compaction/hook.js";
-import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
+import { compactAtConfiguredThreshold, type AutoCompactionTrigger } from "./compaction/threshold.js";
+import type { CompactionOwnerObserver } from "./compaction/owner.js";
+import { unregisteredRunnerNotice } from "./agents/runner-notice.js";
 import {
   createToolOwnershipReassertion,
   fabricModelContext,
   FabricToolLifecycle,
   FabricToolOwnership,
+  fabricToolPlacement,
   ownsFabricToolSource,
 } from "./core/tool-ownership.js";
+import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
+import { formatForeground } from "./core/foreground-tools.js";
 import {
   expandSkillDirMarkersForRead,
   expandSkillDirMarkersInSkillBlock,
 } from "./core/skill-dir.js";
 import { coreOverridePromptGuidance } from "./core/core-override-guidance.js";
-import { PI_CORE_TOOL_NAMES } from "./core/pi-tools.js";
+import { PI_CORE_TOOL_NAMES, PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
 import {
   fabricExecutionKernelGuidance,
   defaultFabricExecutionGuidance,
@@ -87,14 +92,21 @@ import {
 import { buildSkillReferenceGuidance } from "./core/skill-references.js";
 import { createFabricExecTool } from "./fabric-exec-tool.js";
 import { FabricState } from "./fabric-state.js";
+import { FABRIC_THINKING_BOUNDS_ENV } from "./thinking.js";
 import { classifyToolResult } from "./repairs/classify.js";
 import { getActiveRepairCompiler } from "./repairs/active.js";
 import { piHostCompatibilityWarning } from "./host-compatibility.js";
 import {
   FABRIC_COMPONENT_REGISTER_EVENT,
+  FABRIC_PROGRAM_RUN_EVENT,
   FABRIC_PROVIDER_REGISTER_EVENT,
+  FABRIC_PROVIDER_WITHDRAW_EVENT,
+  FABRIC_TOOL_PLACEMENT_EVENT,
+  readFabricProviderWithdrawalV1,
+  readFabricToolPlacementRequestV1,
   type FabricComponentRegistration,
   type FabricProviderRegistration,
+  type FabricToolPlacementMode,
 } from "./protocol.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
 import { FabricUiController } from "./ui/controller.js";
@@ -178,6 +190,23 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;
   let compatibilityWarningShown = false;
+  // Host scope issuance is read once here; its parser loads only when present (src/scope.ts).
+  const scopeEnv = { json: process.env.PI_FABRIC_SCOPE, file: process.env.PI_FABRIC_SCOPE_FILE };
+  const sealScope = async (): Promise<void> => {
+    const issued = ((globalThis as Record<symbol, { sealed?: boolean; error?: string } | undefined>)[
+      Symbol.for("pi-fabric:scope:v1")] ??= {});
+    if (issued.sealed) return;
+    if (!scopeEnv.json && !scopeEnv.file) {
+      issued.sealed = true;
+      return;
+    }
+    try {
+      (await import("./scope.js")).sealRootScope(scopeEnv);
+    } catch (error) {
+      issued.sealed = true;
+      issued.error ??= error instanceof Error ? error.message : String(error);
+    }
+  };
   configureHighlighting(
     codePreviewSettings.shikiTheme,
     codePreviewSettings.syntaxHighlighting,
@@ -252,6 +281,68 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       );
     },
   );
+
+  // Direct registrations only: component-owned providers withdraw through
+  // their component lease. Unknown names and generation mismatches are no-ops.
+  const unsubscribeProviderWithdrawal = pi.events.on(
+    FABRIC_PROVIDER_WITHDRAW_EVENT,
+    (value: unknown) => {
+      const withdrawal = readFabricProviderWithdrawalV1(value);
+      if (!withdrawal) throw new Error("Invalid Pi Fabric provider withdrawal");
+      if (!state.withdrawExternal(withdrawal.name, withdrawal.generation) && process.env.PI_FABRIC_DEBUG) {
+        console.debug(`[pi-fabric] ignored provider withdrawal: ${withdrawal.name}`);
+      }
+    },
+  );
+
+  // Synchronous reachability answer so extensions stop guessing whether the
+  // model or a fabric_exec program can reach a tool this turn.
+  const programReachable = (registered: ReadonlySet<string>): ((name: string) => boolean) => {
+    if (!state.initialized) return () => false;
+    const allowlist = readChildToolAllowlist();
+    const registry = state.registry;
+    return (name) => {
+      if (allowlist && !allowlist.has(name)) return false;
+      const captured = capturedTools.get(name) !== undefined;
+      if (PI_CORE_TOOL_NAME_SET.has(name)) {
+        if (!registry.has("pi")) return false;
+        if (options.managedHost) return captured;
+        return name !== "powershell" || captured || registered.has(name);
+      }
+      return captured && registry.has("extensions");
+    };
+  };
+  const unsubscribeToolPlacement = pi.events.on(
+    FABRIC_TOOL_PLACEMENT_EVENT,
+    (value: unknown) => {
+      const request = readFabricToolPlacementRequestV1(value);
+      if (!request) throw new Error("Invalid Pi Fabric tool placement query");
+      const config = state.bootstrapped ? state.config : DEFAULT_FABRIC_CONFIG;
+      const mode: FabricToolPlacementMode = config.schema.mode === "enforce"
+        ? "enforce"
+        : config.fullCodeMode ? "full-code" : "orchestration";
+      const registered = pi.getAllTools().map((tool) => tool.name);
+      request.reply(fabricToolPlacement({
+        mode,
+        registered,
+        active: pi.getActiveTools(),
+        program: programReachable(new Set(registered)),
+        foreground: state.foregroundTools().tools,
+        ...(request.tools ? { tools: request.tools } : {}),
+      }));
+    },
+  );
+
+  // Host program runs (daemons, embedders) use the live session's context.
+  let programRunContext: ExtensionContext | undefined;
+  const unsubscribeProgramRun = pi.events.on(FABRIC_PROGRAM_RUN_EVENT, (value: unknown) => {
+    const reply = (value as { reply?: unknown } | null)?.reply;
+    if (typeof reply !== "function") throw new Error("Invalid Pi Fabric program run request");
+    void import("./programs/host.js").then(
+      ({ handleFabricProgramRunEvent }) => handleFabricProgramRunEvent(value, { state, pi, context: programRunContext }),
+      (error: unknown) => reply({ ok: false, error: `Fabric program host unavailable: ${String(error)}` }),
+    );
+  });
 
   pi.on("resources_discover", async (_event, context) => {
     if (!state.bootstrapped) await state.bootstrap(context);
@@ -539,6 +630,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
   pi.on("session_start", async (_event, context) => {
+    await sealScope();
     clearEntropyRetry();
     entropyStopping = false;
     entropyLifecycleEpoch += 1;
@@ -562,7 +654,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         if (context.hasUI) context.ui.notify(warning, "warning");
       }
     }
+    state.thinking.invalidate();
+    programRunContext = context;
     await state.bootstrap(context);
+    // A Fabric child narrows its level into the parent's inherited bounds.
+    if (process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined && state.bootstrapped) {
+      try {
+        await state.thinking.enforceBounds(context);
+      } catch (error) {
+        console.warn(`[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
     // new session that inherited the in-place executor can snap back.
     await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
@@ -574,6 +676,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // Branch changes move the leaf: emitted echoes and spent reminder budget
   // must track it exactly. Rewind removes abandoned-branch residue.
   pi.on("session_tree", async (_event, context) => {
+    state.thinking.invalidate();
     proxyContract.reset();
     refreshProxyLedger(context);
     // Pi emits session_tree before it clears and rebuilds the transcript:
@@ -596,7 +699,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (state.initialized) await state.publishHostLifecycle("pi.agent_start", event);
   });
 
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async (event, context) => {
+    try {
+      // Turn-scoped thinking overrides revert here, even before activation.
+      await state.thinking.agentEnded(context);
+    } catch (error) {
+      console.warn(`[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
   });
 
@@ -645,7 +754,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // so ExtensionRunner does not finish this handler (and Pi does not publish
     // its public agent_settled event) before compaction settles.
     await state.compact.maybeCommit(context);
-    await compactAtConfiguredThreshold(context, state.config);
+    await compactAtConfiguredThreshold(
+      context,
+      state.config,
+      (trigger: AutoCompactionTrigger, committed: boolean) =>
+        state.compact.noteAutoCompaction(trigger, committed),
+    );
     await state.publishHostLifecycle("pi.agent_settled", event);
   });
 
@@ -773,7 +887,31 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   });
 
+  // Ownership is observed, never contested: the committed entry says who
+  // produced it, and a foreign owner under the Fabric engine earns one
+  // load-order explanation per session.
+  // The observer loads at the first committed compaction; a deliberate yield
+  // noted before then is handed over when it does.
+  let compactionOwners: Promise<CompactionOwnerObserver> | undefined;
+  let compactionYieldPending = false;
   pi.on("session_compact", async (event, context) => {
+    const fabricEngine = (state.bootstrapped ? state.config : DEFAULT_FABRIC_CONFIG).compaction.engine === "fabric";
+    const observer = await (compactionOwners ??= import("./compaction/owner.js").then(
+      (module) => new module.CompactionOwnerObserver(),
+    ));
+    if (compactionYieldPending) {
+      compactionYieldPending = false;
+      observer.noteDeliberateYield();
+    }
+    const { warning } = observer.observe(
+      context.sessionManager.getSessionId(),
+      event.compactionEntry,
+      fabricEngine,
+    );
+    if (warning) {
+      if (context.hasUI) context.ui.notify(warning, "warning");
+      else console.warn(`[pi-fabric] ${warning}`);
+    }
     if (!state.initialized) return;
     await state.publishHostLifecycle("pi.session_compact", event);
   });
@@ -798,9 +936,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       state.cwd
         ? state.config.compaction.tokenThresholds[modelKey]
         : DEFAULT_FABRIC_CONFIG.compaction.tokenThresholds[modelKey],
+    getOutputReserveTokens: () =>
+      state.bootstrapped
+        ? state.config.compaction.outputReserveTokens
+        : DEFAULT_FABRIC_CONFIG.compaction.outputReserveTokens,
+    onYield: () => {
+      compactionYieldPending = true;
+    },
   });
 
-  pi.on("context", (event, context) => {
+  pi.on("context", async (event, context) => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
       ? state.prewalk.pendingContinuationMessage(sessionId)
@@ -838,6 +983,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       });
       return messageChanged ? { ...message, content } : message;
     });
+    const repairOrphans = (state.bootstrapped ? state.config : DEFAULT_FABRIC_CONFIG).compaction.repairOrphans;
+    if (!repairOrphans) return changed ? { messages } : undefined;
+    // Identity-preserving: a defect-free list comes back unchanged.
+    const { repairToolResultPairing } = await import("./compaction/orphan-repair.js");
+    const repaired = repairToolResultPairing(messages);
+    if (repaired.messages !== messages) return { messages: repaired.messages };
     return changed ? { messages } : undefined;
   });
 
@@ -961,6 +1112,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     entropyCompilePending = undefined;
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
+    unsubscribeProviderWithdrawal();
+    unsubscribeToolPlacement();
+    unsubscribeProgramRun();
+    programRunContext = undefined;
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -981,16 +1136,52 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // set (e.g. a permission system filtering its allowlist at before_agent_start,
   // or a refresh that ran before Fabric's policy was active), captured tools
   // must not leak into the model's next turn.
-  pi.on("before_agent_start", () => {
+  // Foreground refusals are never silent: one notice per session, plus status.
+  let foregroundNoticeSession: string | undefined;
+  pi.on("before_agent_start", (_event, context) => {
     reassertToolOwnership();
+    const foreground = state.foregroundTools();
+    if (foreground.refused.length === 0) return;
+    const sessionId = context.sessionManager?.getSessionId?.() ?? "";
+    if (foregroundNoticeSession === sessionId) return;
+    foregroundNoticeSession = sessionId;
+    const notice = `Fabric foreground policy ${formatForeground(foreground)}`;
+    if (context.hasUI) context.ui.notify(notice, "warning");
+    else console.warn(`[pi-fabric] ${notice}`);
+  });
+
+  // A configured custom runner is kept even before its extension registers it
+  // (load order), so launches fail closed. Say so before the first turn instead
+  // of at the first agents.run. Registrations live on a globalThis map, so this
+  // check never loads the runner module.
+  let runnerNoticeKey: string | undefined;
+  pi.on("before_agent_start", (_event, context) => {
+    if (!state.bootstrapped) return;
+    const runner = state.config.agents.runner;
+    const notice = unregisteredRunnerNotice(
+      runner,
+      (globalThis as Record<symbol, Map<string, unknown> | undefined>)[
+        Symbol.for("pi-fabric.runnerRegistry.v1")
+      ]?.keys() ?? [],
+    );
+    if (!notice) return;
+    const key = `${context.sessionManager?.getSessionId?.() ?? ""}\0${runner}`;
+    if (runnerNoticeKey === key) return;
+    runnerNoticeKey = key;
+    if (context.hasUI) context.ui.notify(notice, "warning");
+    else console.warn(`[pi-fabric] ${notice}`);
   });
 
   pi.on("context_with_system", (event) => {
     if (!fabricOwnsModelTools()) return;
     reassertToolOwnership();
-    return { messages: fabricModelContext(event.messages, {
+    const foreground = state.foregroundTools().tools;
+    const registered = foreground.length === 0 ? [] : pi.getAllTools();
+    const declared = foreground.flatMap((name) => registered.filter((tool) => tool.name === name)
+      .map(({ description, parameters }) => ({ name, description, parameters })));
+    return { messages: fabricModelContext(event.messages, [{
       name: fabricTool.name, description: fabricTool.description, parameters: fabricTool.parameters,
-    }) };
+    }, ...declared]) };
   });
 
   registerFabricCommand(pi, {

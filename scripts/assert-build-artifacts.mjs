@@ -14,6 +14,7 @@ const stable = [
   "agents.js",
   "jev.js",
   "protocol.js",
+  "scope.js",
   "core/provider-operations.js",
   "worker.js",
   "residency/host.js",
@@ -27,8 +28,11 @@ const stable = [
   "memory/file-worker.js",
   "memory/worker-provider.js",
   "providers/memory-provider.js",
+  "cli/index.js",
 ];
 const lazy = [
+  "cli/mesh.js",
+  "cli/decisions.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -62,6 +66,7 @@ const lazy = [
   "worker/event-projection.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
+  "worker/result.js",
   "worker/run-record.js",
   "worker/session-export.js",
 ];
@@ -79,7 +84,7 @@ if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.joi
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
-for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions])) {
+for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions, manifest.bin])) {
   if (!target.startsWith("./dist/") || target.split("/").includes("..") || !existsSync(join(root, target))) {
     throw new Error(`Missing or unpackaged public entrypoint: ${target}`);
   }
@@ -123,12 +128,24 @@ const staticClosure = (roots) => {
   return visited;
 };
 
+// Bootstrap diagnostics must survive missing runtime dependencies.
+for (const file of staticClosure([join(dist, "worker.js")])) {
+  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+    if (!match[1].startsWith(".") && !match[1].startsWith("node:")) {
+      throw new Error(`Worker bootstrap imports an external package: ${match[1]}`);
+    }
+  }
+}
+const validator = readFileSync(join(dist, "worker/result.js"), "utf8");
+if ([...validator.matchAll(staticImport)].length || /\bimport\s*\(/.test(validator)) {
+  throw new Error("Worker validator must be self-contained");
+}
 const startupFiles = staticClosure([join(dist, "index.js")]);
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
 if (startupBytes > 1150 * 1024 || startupFiles.size > 44) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
-const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric"];
+const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord"];
 for (const file of startupFiles) {
   for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
     if (optionalPackages.some(name => match[1] === name || match[1]?.startsWith(`${name}/`))) {
@@ -147,6 +164,16 @@ const initialSource = [...startupFiles]
 for (const forbidden of ["src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
+  }
+}
+// The `pi-fabric` bin is standalone: an executable entry that never loads the extension.
+const cliEntry = join(dist, "cli/index.js");
+if (!readFileSync(cliEntry, "utf8").startsWith("#!/usr/bin/env node\n")) {
+  throw new Error("pi-fabric CLI entry lost its node shebang");
+}
+for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")])]) {
+  if (file === join(dist, "index.js") || readFileSync(file, "utf8").includes("src/fabric-runtime-state.ts")) {
+    throw new Error(`pi-fabric CLI statically reaches the extension graph: ${file}`);
   }
 }
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));

@@ -436,6 +436,9 @@ globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 globalThis.cache = __providerProxy("cache");
+globalThis.thinking = __providerProxy("thinking");
+globalThis.decisions = __providerProxy("decisions");
+globalThis.programs = __providerProxy("programs");
 globalThis.prewalk = __providerProxy("prewalk");
 globalThis.jev = __providerProxy("jev");
 const __createActor = async (args = {}) => {
@@ -531,6 +534,11 @@ globalThis.mesh = Object.freeze({
   list: (args = {}) => __call("mesh.list", args),
   put: (args) => __call("mesh.put", args),
   delete: (args) => __call("mesh.delete", args),
+  scheduled: (args = {}) => __call("mesh.scheduled", args),
+  unschedule: (args) => __call("mesh.unschedule", args),
+  grant: (args) => __call("mesh.grant", args),
+  revoke: (args) => __call("mesh.revoke", args),
+  grants: () => __call("mesh.grants", {}),
 });
 // The mcp proxy itself stays schema-less — the registry validates args at
 // dispatch — but guestTypeDeclarations renders per-server argument types from

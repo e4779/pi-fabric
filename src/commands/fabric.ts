@@ -54,6 +54,7 @@ import {
 } from "../entropy/presentation.js";
 import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
 import { setActiveCompiledSurface } from "../entropy/active.js";
+import { formatForeground } from "../core/foreground-tools.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -353,6 +354,9 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "kill",
         "repairs",
         "entropy",
+        "decisions",
+        "programs",
+        "run",
       ];
       const idCommands = new Set([
         "messages",
@@ -601,6 +605,16 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command === "chat") {
         await fabricUi.openConversation(context, argumentsList.join(" ") || undefined);
+        return;
+      }
+      if (command === "decisions") {
+        const { openFabricDecisions } = await import("../decisions/command.js");
+        await openFabricDecisions(state.mesh, context, argumentsList[0]);
+        return;
+      }
+      if (command === "programs" || command === "run") {
+        const { runFabricProgramsCommand } = await import("../programs/host.js");
+        await runFabricProgramsCommand({ state, pi }, context, command, argumentsText.trim().slice(command.length));
         return;
       }
       if (command === "dashboard" || command === "ui") {
@@ -1196,7 +1210,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|chat [id-or-name]|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy]",
+          "Usage: /fabric [status|dashboard|chat [id-or-name]|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy|decisions [id]|programs [promote|retire <ref>]|run <ref> [json]]",
           "warning",
         );
         return;
@@ -1227,6 +1241,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           config.fullCodeMode && config.capture.enabled
             ? `captured tools: ${capturedTools.size} · model visibility: ${config.capture.hideFromModel ? "hidden" : "visible"}`
             : "captured tools: disabled (native registry preserved)",
+          ...(config.foreground.tools.length > 0 ? [`foreground: ${formatForeground(state.foregroundTools())}`] : []),
           `actors: ${state.actors.list().length} · mesh: ${config.mesh.enabled ? state.mesh.root : "disabled"}`,
           `MCP: ${config.mcp.enabled ? "enabled" : "disabled"}`,
           `UI: ${config.ui.enabled ? `${config.ui.widget} widget above chat` : "disabled"}`,

@@ -64,6 +64,7 @@ export const parseWorkerOptions = (
   const args = argumentMap(argv);
   const model = optional(args, "model");
   const thinking = optional(args, "thinking");
+  const thinkingBounds = optional(args, "thinking-bounds");
   const fabricExtensionPath = optional(args, "fabric-extension");
   const schemaFile = optional(args, "schema-file");
   const imagesFile = optional(args, "images-file");
@@ -107,8 +108,16 @@ export const parseWorkerOptions = (
   const ownerIdentityId = optional(args, "owner-identity-id");
   const runRoot = optional(args, "run-root");
   const steerFile = optional(args, "steer-file");
+  const childQuestions = optional(args, "child-questions");
+  const childQuestionTimeoutMs = childQuestions === undefined ? undefined : Number(childQuestions);
+  if (childQuestionTimeoutMs !== undefined && !(Number.isInteger(childQuestionTimeoutMs) && childQuestionTimeoutMs >= 1_000)) {
+    throw new Error("Invalid worker child-questions timeout");
+  }
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
+  const writePolicy = optional(args, "write-policy");
+  const scope = optional(args, "scope");
+  const lineage = optional(args, "lineage");
   const maxTokens = optional(args, "max-tokens");
   const carryOverSource = optional(args, "carry-over");
   const runnerSessionId = optional(args, "runner-session-id");
@@ -185,6 +194,7 @@ export const parseWorkerOptions = (
     ...(fabricExtensionPath ? { fabricExtensionPath } : {}),
     ...(model ? { model } : {}),
     ...(thinking ? { thinking } : {}),
+    ...(thinkingBounds ? { thinkingBounds } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
     ...(persistSession ? { persistSession: true } : {}),
     ...(modelAdmission ? { modelAdmission } : {}),
@@ -203,8 +213,12 @@ export const parseWorkerOptions = (
     ...(runnerSessionId ? { runnerSessionId } : {}),
     ...(runRoot ? { runRoot } : {}),
     ...(steerFile ? { steerFile } : {}),
+    ...(childQuestionTimeoutMs !== undefined ? { childQuestionTimeoutMs } : {}),
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
+    ...(writePolicy ? { writePolicy } : {}),
+    ...(scope ? { scope } : {}),
+    ...(lineage ? { lineage } : {}),
     ...(maxTokens ? { maxTokens: Number(maxTokens) } : {}),
     ...(carryOver ? { carryOver } : {}),
     ...(inheritedSessionPins && inheritedSessionPins.length > 0 ? { inheritedSessionPins } : {}),

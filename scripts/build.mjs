@@ -7,7 +7,14 @@ const primaryEntryPoints = [
   "src/memory.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  // Runner adapter registration; never reachable from the extension entry.
+  "src/runners.ts",
+  // Opt-in durable Pi adapter; never reachable from the extension entry.
+  "src/durable.ts",
   "src/jev.ts",
+  "src/assessment.ts",
+  // Public `pi-fabric/scope`; also the extension's first-use scope parser.
+  "src/scope.ts",
   "src/protocol.ts",
   "src/worker.ts",
   "src/residency/host.ts",
@@ -24,17 +31,29 @@ const primaryEntryPoints = [
   "src/memory/file-worker.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
+  // Standalone `pi-fabric` bin; never reachable from the extension entry.
+  "src/cli/index.ts",
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/type-error-guidance.ts",
+  "src/cli/mesh.ts",
+  "src/cli/decisions.ts",
+  "src/thinking-control.ts",
+  "src/compaction/owner.ts",
+  "src/compaction/orphan-repair.ts",
+  "src/decisions/command.ts",
+  "src/programs/host.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
+  // Also loaded by the worker as a Pi extension (-e) for confined children.
+  "src/agents/write-guard.ts",
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
@@ -69,7 +88,9 @@ const lazyEntryPoints = [
   "src/worker/event-projection.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
+  "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",
+  "src/worker/result.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];
@@ -108,6 +129,29 @@ const bundledPackages = Object.keys(result.metafile.inputs).filter((input) =>
 );
 if (bundledPackages.length > 0) {
   throw new Error(`Package code was bundled unexpectedly:\n${bundledPackages.join("\n")}`);
+}
+
+// Only the standalone worker gets a private, stateless TypeBox validator.
+// Pi deliberately omits physical host peers; the extension graph above must
+// continue to use Pi's mapped TypeBox, never this isolated artifact.
+const workerResult = await build({
+  entryPoints: ["src/worker/result.ts"],
+  outfile: "dist/worker/result.js",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  metafile: true,
+  banner: { js: "// Worker-only TypeBox validator. MIT (c) 2017-2026 Haydn Paterson; see THIRD_PARTY_NOTICES.md." },
+});
+for (const input of Object.keys(workerResult.metafile.inputs)) {
+  if (input.includes("node_modules/") && !input.includes("node_modules/typebox/")) {
+    throw new Error(`Unexpected worker validator dependency: ${input}`);
+  }
+}
+if (Object.values(workerResult.metafile.outputs).some(output => output.imports.length > 0)) {
+  throw new Error("Worker validator must be self-contained");
 }
 
 const unstableLazyImports = Object.entries(result.metafile.outputs).flatMap(

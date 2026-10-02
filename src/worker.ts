@@ -2,14 +2,18 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import crossSpawn from "cross-spawn";
+import { assertWorkerRuntime, writeWorkerStartupFailure } from "./worker/startup.js";
+
 import { StringDecoder } from "node:string_decoder";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   AgentRunRecord,
   AgentRunStatus,
 } from "./agents/types.js";
+
+let crossSpawn: typeof import("cross-spawn");
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -50,12 +54,20 @@ const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
   return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
 };
 
-type AgentResultModule = typeof import("./agents/result.js");
+type AgentResultModule = typeof import("./worker/result.js");
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
-  if (!import.meta.url.endsWith(".ts")) return import("./agents/result.js");
-  const sourceModulePath = "./agents/result.ts";
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/result.js");
+  const sourceModulePath = "./worker/result.ts";
   return import(sourceModulePath) as Promise<AgentResultModule>;
+};
+
+type WorkerQuestionsModule = typeof import("./worker/questions.js");
+
+const loadWorkerQuestions = async (): Promise<WorkerQuestionsModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/questions.js");
+  const sourceModulePath = "./worker/questions.ts";
+  return import(sourceModulePath) as Promise<WorkerQuestionsModule>;
 };
 
 const loadWorkerOptions = async (): Promise<WorkerOptionsModule> => {
@@ -189,9 +201,13 @@ let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 const writeCrashStatus = (error: unknown): void => {
-  if (!crashContext || !runRecordHelpers || terminalWritten) return;
+  if (terminalWritten) return;
   try {
-    runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+    if (crashContext && runRecordHelpers) {
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+    } else {
+      writeWorkerStartupFailure(process.argv, error);
+    }
   } catch {
     // Best effort: if the crash-status write itself fails, #monitor falls back
     // to "Agent transport exited without a result".
@@ -209,6 +225,8 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
+  assertWorkerRuntime();
+  crossSpawn = (await import("cross-spawn")).default;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -293,6 +311,12 @@ const main = async (): Promise<void> => {
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  if (options.writePolicy) {
+    // The guard loads even with --no-extensions; other runners cannot enforce it.
+    if (options.runner !== "pi") throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
+    const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
+    piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
+  }
   if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
@@ -351,6 +375,8 @@ const main = async (): Promise<void> => {
         : {}),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
+      // A child Fabric intersects its own thinking.bounds with these.
+      ...(options.thinkingBounds ? { PI_FABRIC_THINKING_BOUNDS: options.thinkingBounds } : {}),
       PI_FABRIC_AGENT_NAME: options.name,
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
@@ -377,6 +403,12 @@ const main = async (): Promise<void> => {
         ? { PI_FABRIC_OWNER_IDENTITY_ID: options.ownerIdentityId }
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
+      // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
+      ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      // Exactly the manager's derived scope; undefined drops an inherited value.
+      PI_FABRIC_SCOPE: options.scope,
+      PI_FABRIC_SCOPE_FILE: undefined,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -396,6 +428,18 @@ const main = async (): Promise<void> => {
   let retryPending = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
+  // agents.childQuestions "route": child dialogs wait for a parent ui_response.
+  const questionRelay = options.childQuestionTimeoutMs !== undefined && options.runner === "pi" && options.steerFile
+    ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
+        emit: (question) => emitLifecycle("question", { ...question }),
+        send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
+        blocked: (since) => {
+          if (since === undefined) delete record.blockedOn;
+          else record.blockedOn = { since };
+          update();
+        },
+      })
+    : undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
@@ -891,7 +935,8 @@ const main = async (): Promise<void> => {
       const method = event.method;
       if (
         typeof event.id === "string" &&
-        (method === "select" || method === "confirm" || method === "input" || method === "editor")
+        (method === "select" || method === "confirm" || method === "input" || method === "editor") &&
+        !questionRelay?.request(event)
       ) {
         child.stdin?.write(
           `${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
@@ -1086,7 +1131,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { type?: string; message?: string; mode?: string; instructions?: string };
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; requestId?: string };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1130,6 +1175,8 @@ const main = async (): Promise<void> => {
             child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
+          } else if (command.type === "ui_response") {
+            questionRelay?.respond(command);
           }
         } catch {
           /* stdin closed (settled/stopped child); a late steer is dropped */
@@ -1228,6 +1275,8 @@ const main = async (): Promise<void> => {
   });
 
   if (steerTimer) clearInterval(steerTimer);
+  questionRelay?.close();
+  delete record.blockedOn;
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);

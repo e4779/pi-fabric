@@ -3,8 +3,13 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  writeJsonAtomic,
+  ownerHeartbeatFields,
+  recordOwnerLiveness,
+  startOwnerHeartbeat,
+} from "../core/atomic-write.js";
 import {
   normalizeModelAliases,
   resolveAvailablePiModel,
@@ -18,6 +23,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
+import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -71,6 +77,28 @@ const processAlive = (pid: number): boolean => {
   }
 };
 
+// Identity-less (pre-heartbeat) owners keep the plain signal probe; an owner
+// in another PID namespace is judged by its heartbeat, and "unknown" is not death.
+const ownerAlive = (record: unknown): boolean =>
+  recordOwnerLiveness(record, { legacyAlive: processAlive }) !== "dead";
+
+// The resident host runs Pi with --no-extensions, so a custom runner is only
+// registered here when its residentModule is imported (once per process).
+const runnerModules = new Map<string, Promise<void>>();
+const loadRunnerModule = (specifier: string): Promise<void> => {
+  if (!/^(?:\/|[A-Za-z]:[\\/]|file:)/.test(specifier)) {
+    return Promise.reject(new Error(`Fabric runner module must be absolute: ${specifier}`));
+  }
+  const url = specifier.startsWith("file:") ? specifier : pathToFileURL(specifier).href;
+  let pending = runnerModules.get(url);
+  if (!pending) {
+    pending = import(url).then(() => undefined);
+    runnerModules.set(url, pending);
+    pending.catch(() => runnerModules.delete(url));
+  }
+  return pending;
+};
+
 class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
@@ -119,6 +147,30 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
+/**
+ * The resident host's idle rule. Live durable participants, queued work or a
+ * pending request keep it alive; pending mesh schedules do too while at least
+ * one durable participant could receive them, and `wakeAt` names the next due
+ * time so the host releases it on time. Without durable participants a
+ * schedule waits for the next Fabric process that touches the mesh.
+ */
+export const residentIdleDecision = (input: {
+  now: number;
+  idleSince: number;
+  activeActor: boolean;
+  activeAgent: boolean;
+  pendingRequest: boolean;
+  durableParticipants: boolean;
+  nextScheduleDueAt: number | undefined;
+  idleExitMs?: number;
+}): { busy: boolean; exit: boolean; wakeAt?: number } => {
+  const holdsSchedules = input.nextScheduleDueAt !== undefined && input.durableParticipants;
+  const wakeAt = holdsSchedules ? input.nextScheduleDueAt : undefined;
+  const busy = input.activeActor || input.activeAgent || input.pendingRequest || holdsSchedules;
+  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? IDLE_EXIT_MS);
+  return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
+};
+
 class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
@@ -138,6 +190,9 @@ class ResidentHost {
   readonly #deliveryPrefix: string;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
+  #scheduleTimer: NodeJS.Timeout | undefined;
+  #scheduleWakeAt: number | undefined;
+  #stopHeartbeat: (() => void) | undefined;
   #pollingRequests = false;
   #closed = false;
   #started = false;
@@ -158,16 +213,17 @@ class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    this.control = new FabricControlPlane(this.mesh, this.identity, {
+      enabled: true,
+      hostId: this.hostId,
+      pollMs: config.mesh.actorPollMs,
+    });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
-    });
-    this.control = new FabricControlPlane(this.mesh, this.identity, {
-      enabled: true,
-      hostId: this.hostId,
-      pollMs: config.mesh.actorPollMs,
+      ownerIncarnation: this.control.incarnation,
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -303,11 +359,23 @@ class ResidentHost {
     if (this.#started) return;
     this.#acquireLock();
     this.#started = true;
+    this.#stopHeartbeat = startOwnerHeartbeat((heartbeatAt) => this.#refreshHeartbeat(heartbeatAt));
+    try {
+      await this.#startOwned();
+    } catch (error) {
+      this.#stopHeartbeat();
+      this.#stopHeartbeat = undefined;
+      throw error;
+    }
+  }
+
+  async #startOwned(): Promise<void> {
     fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
     this.#recoverInterruptedRequests();
+    await this.#recoverHostedRuns();
     const firstSeenAgents = new Map<string, number>();
     this.participants.registerSource(() =>
       agentParticipantRecords(
@@ -348,6 +416,7 @@ class ResidentHost {
       token: this.#token,
       startedAt: now,
       readyAt: now,
+      ...ownerHeartbeatFields(now),
     };
     atomicWrite(this.#ownerPath, owner);
     fs.rmSync(this.#errorPath, { force: true });
@@ -359,6 +428,10 @@ class ResidentHost {
     this.#closed = true;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#stopHeartbeat?.();
+    this.#stopHeartbeat = undefined;
     while (this.#pollingRequests) await delay(10);
     await this.participants.quiesce().catch(() => undefined);
     await this.lifecycle.close().catch(() => undefined);
@@ -413,7 +486,7 @@ class ResidentHost {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -439,7 +512,7 @@ class ResidentHost {
         command.targetId,
         message,
         command.data,
-        command.binding !== undefined ? { binding: command.binding } : {},
+        { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
       );
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
@@ -484,7 +557,12 @@ class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn },
+      {
+        message,
+        data: event,
+        triggerTurn: subscription.triggerTurn,
+        ...(target.ownerIncarnation ? { ownerIncarnation: target.ownerIncarnation } : {}),
+      },
       target.ownerIdentityId,
     );
   }
@@ -570,11 +648,46 @@ class ResidentHost {
     } catch {
       // Missing request directory is empty.
     }
-    if (activeActor || activeAgent || pendingRequest) {
-      this.#idleSince = Date.now();
+    let nextScheduleDueAt: number | undefined;
+    try {
+      nextScheduleDueAt = this.mesh.nextScheduleDueAt();
+    } catch {
+      // Unreadable schedules neither keep the host alive nor stop it.
+    }
+    const now = Date.now();
+    const decision = residentIdleDecision({
+      now,
+      idleSince: this.#idleSince,
+      activeActor,
+      activeAgent,
+      pendingRequest,
+      durableParticipants: activeActor || activeAgent,
+      nextScheduleDueAt,
+    });
+    this.#armScheduleWake(decision.wakeAt);
+    if (decision.busy) {
+      this.#idleSince = now;
       return;
     }
-    if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
+    if (decision.exit) this.onIdle();
+  }
+
+  // Re-armed on every idle check: the due time of the earliest pending
+  // schedule, released here even if no actor monitor polls in time.
+  #armScheduleWake(wakeAt: number | undefined): void {
+    if (wakeAt === this.#scheduleWakeAt) return;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#scheduleWakeAt = wakeAt;
+    if (wakeAt === undefined || this.#closed) return;
+    this.#scheduleTimer = setTimeout(() => {
+      this.#scheduleTimer = undefined;
+      this.#scheduleWakeAt = undefined;
+      void this.mesh.releaseDueSchedules().catch(() => undefined).finally(() => {
+        if (!this.#closed) this.#checkIdle();
+      });
+    }, Math.min(Math.max(0, wakeAt - Date.now()), 2_147_000_000));
+    this.#scheduleTimer.unref();
   }
 
   async #processRequest(filePath: string): Promise<void> {
@@ -592,6 +705,7 @@ class ResidentHost {
       if (command.operation === "spawn") {
         if (
           command.request.sessionSeed ||
+          command.request.forkSeed ||
           command.request.sessionFile ||
           command.request.actorId ||
           command.request.actorName ||
@@ -602,7 +716,10 @@ class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
+        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
+        // spawn already validated the forwarded scope; record what the child received.
+        const scope = launchScope(command.request.scope, command.request.inheritedScope);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) throw new Error(`Resident agent ${handle.id} has no run directory`);
         const worktreeGitRoot = this.agents.worktreeGitRoot(handle.id);
@@ -613,6 +730,8 @@ class ResidentHost {
           runDirectory,
           handle: { ...handle, residency: "durable" },
           ...(worktreeGitRoot ? { worktreeGitRoot } : {}),
+          ...(command.runnerModule ? { runnerModule: command.runnerModule } : {}),
+          ...(scope ? { scope } : {}),
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -685,6 +804,29 @@ class ResidentHost {
     this.participants.scheduleRefresh();
   }
 
+  /**
+   * Re-import the runner modules recorded for this host's durable runs, then
+   * re-attach their hosted runs from the persisted locators. A run whose
+   * runner cannot be loaded settles indeterminate; nothing is re-submitted.
+   */
+  async #recoverHostedRuns(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.#agentsPath).filter((entry) => entry.endsWith(".json"));
+    } catch {
+      entries = [];
+    }
+    const modules = new Set<string>();
+    for (const entry of entries) {
+      const metadata = readJson<ResidentAgentMetadata>(path.join(this.#agentsPath, entry));
+      if (metadata?.rootId === this.config.rootId && typeof metadata.runnerModule === "string") {
+        modules.add(metadata.runnerModule);
+      }
+    }
+    for (const module of modules) await loadRunnerModule(module).catch(() => undefined);
+    await this.agents.recoverHostedRuns().catch(() => []);
+  }
+
   #recoverInterruptedRequests(): void {
     let entries: string[];
     try {
@@ -699,6 +841,7 @@ class ResidentHost {
         requestId,
         ok: false,
         error: "Fabric residency outcome is indeterminate after resident host restart",
+        outcome: "indeterminate",
         completedAt: Date.now(),
       };
       atomicWrite(path.join(this.#responsesPath, entry), response);
@@ -709,27 +852,36 @@ class ResidentHost {
   #acquireLock(): void {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
     const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && processAlive(existing.pid)) {
+    if (existing && ownerAlive(existing)) {
       throw new ResidentHostAlreadyRunning(`Fabric resident host is already running (${existing.pid})`);
     }
     try {
       const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
+      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, ...ownerHeartbeatFields() }));
       fs.closeSync(descriptor);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "EEXIST") {
         const locked = readJson<{ pid?: unknown }>(this.#lockPath);
-        if (typeof locked?.pid === "number" && processAlive(locked.pid)) {
+        if (typeof locked?.pid === "number" && ownerAlive(locked)) {
           throw new ResidentHostAlreadyRunning(`Fabric resident host is starting (${locked.pid})`);
         }
         fs.rmSync(this.#lockPath, { force: true });
         const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
+        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, ...ownerHeartbeatFields() }));
         fs.closeSync(descriptor);
       } else {
         throw error;
       }
     }
+  }
+
+  // Long-lived ownership: refresh both the start lock and owner.json while
+  // they are still ours, so readers in other PID namespaces can judge us.
+  #refreshHeartbeat(heartbeatAt: number): void {
+    const lock = readJson<Record<string, unknown>>(this.#lockPath);
+    if (lock?.token === this.#token) atomicWrite(this.#lockPath, { ...lock, heartbeatAt });
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (owner?.token === this.#token) atomicWrite(this.#ownerPath, { ...owner, heartbeatAt });
   }
 
   #releaseLock(): void {

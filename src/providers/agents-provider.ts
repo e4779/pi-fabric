@@ -14,6 +14,12 @@ import type {
   FabricMainAgentTarget,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import {
+  acceptProviderParticipantControl,
+  controlProviderParticipant,
+  isProviderParticipantRef,
+  type ProviderParticipantRegistry,
+} from "../topology/provider-participants.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import {
   DEFAULT_LIFECYCLE_COALESCE_MS,
@@ -48,6 +54,9 @@ import {
   AgentManager,
 } from "../agents/manager.js";
 import { checkedHandoffCompaction } from "../agents/handoff.js";
+import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
+import { readAgentLineage } from "../agents/child-env.js";
+import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
   AgentHandleInfo,
@@ -74,6 +83,11 @@ import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
+import {
+  BUILT_IN_RUNNER_IDS,
+  isFabricRunnerId,
+  requireAgentRunner,
+} from "../agents/runner-registry.js";
 import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
@@ -158,6 +172,12 @@ const longerTimeoutOverride = (
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   const effective = effectiveAgentTimeoutMs(manager.config.timeoutMs, value);
   return effective > manager.config.timeoutMs ? effective : undefined;
+};
+
+const checkedRunner = (value: unknown, fallback: FabricAgentRunner): FabricAgentRunner => {
+  if (value === undefined) return fallback;
+  if (!isFabricRunnerId(value)) throw new Error(`Invalid Fabric agent runner: ${JSON.stringify(value)}`);
+  return value;
 };
 
 const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
@@ -258,13 +278,13 @@ const actorRequest = (
     typeof (args.validWhile as { source?: unknown }).source === "string"
     ? { version: 1 as const, source: (args.validWhile as { source: string }).source }
     : undefined;
-  const runner =
-    args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-      ? args.runner
-      : manager.config.runner;
-  if (runner === "veda") {
+  const runner = checkedRunner(args.runner, manager.config.runner);
+  const runnerAdapter = requireAgentRunner(runner);
+  if (!runnerAdapter.capabilities.persistentSessions) {
     throw new Error(
-      'The Veda runner does not support persistent actors: Veda executes one headless prompt per invocation. Use a Pi or Claude actor, or agents.run({ runner: "veda" }).',
+      runner === "veda"
+        ? 'The Veda runner does not support persistent actors: Veda executes one headless prompt per invocation. Use a Pi or Claude actor, or agents.run({ runner: "veda" }).'
+        : `The ${runnerAdapter.label} runner does not declare persistentSessions; use agents.run() or a runner that supports persistent actors.`,
     );
   }
   const requestedKernel = checkedKernel(args.kernel);
@@ -332,6 +352,8 @@ export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #router: AgentMessageRouter;
   readonly name = "agents";
+  /** Session registry of `provider:` participants; stop/steer/followUp route there. */
+  providerParticipants: ProviderParticipantRegistry | undefined;
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
 
@@ -427,10 +449,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
   ): Record<string, unknown> {
-    const runner = runnerOverride ??
-      (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-        ? args.runner
-        : this.manager.config.runner);
+    const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
     if (runner !== "pi") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
@@ -580,7 +599,11 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const handle = await this.manager.spawn(
-          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
+          this.#applySeed(
+            args,
+            runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
+            context,
+          ),
           context.signal,
         );
         this.participants.scheduleRefresh();
@@ -602,15 +625,29 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig());
+        const request = this.#applySeed(
+          args,
+          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
+          context,
+        );
+        if (request.residency === "durable") this.#assertUnconfinedDurable();
         const kernel = this.manager.resolveKernel(request);
-        const { kernel: _requestedKernel, ...baseRequest } = request;
+        const { kernel: _requestedKernel, ...requestWithScope } = request;
+        // The resident host has no session scope: send the derived scope in full.
+        const inheritedScope = request.residency === "durable" ? childScope(request.scope) : undefined;
+        const { scope: _narrowing, ...unscopedRequest } = requestWithScope;
+        const baseRequest = request.residency === "durable" ? unscopedRequest : requestWithScope;
         const durableRequest = withInheritedSessionPins({
           ...baseRequest,
+          ...(inheritedScope ? { inheritedScope } : {}),
           ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime() } : {}),
           extensions: request.extensions ?? this.manager.config.extensions,
           ...(request.residency === "durable" && request.cwd !== undefined
             ? { cwd: this.manager.resolveCwd(request.cwd) }
+            : {}),
+          // The resident host does not know this session's bounds: send them narrowed.
+          ...(request.residency === "durable"
+            ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
@@ -693,8 +730,11 @@ export class AgentsProvider implements FabricProvider {
           ...(args.includeStale === true ? { includeStale: true } : {}),
         });
       }
-      case "self":
-        return this.participants.self();
+      case "self": {
+        const self = await this.participants.self();
+        const lineage = readAgentLineage();
+        return lineage ? { ...self, lineage } : self;
+      }
       case "main":
         return this.mainAgent.info(context.extensionContext);
       case "sessions":
@@ -738,10 +778,14 @@ export class AgentsProvider implements FabricProvider {
       case "unsubscribe":
         return this.lifecycle.unsubscribe(String(args.id));
       case "models": {
-        const runner =
-          args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-            ? args.runner
-            : this.manager.config.runner;
+        const runner = checkedRunner(args.runner, this.manager.config.runner);
+        const runnerAdapter = requireAgentRunner(runner);
+        if (!BUILT_IN_RUNNER_IDS.has(runner)) {
+          // A registered runner discovers its own models; none means an advisory empty list.
+          return runnerAdapter.models
+            ? [...await runnerAdapter.models({ cwd: this.manager.cwd, refresh: args.refresh === true })]
+            : [];
+        }
         if (runner === "veda") {
           // Veda forwards any -m value to the configured backend; model
           // discovery would require parsing `veda models <backend>`. Return an
@@ -930,6 +974,9 @@ export class AgentsProvider implements FabricProvider {
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
+            ...(participant.ownerIncarnation
+              ? { ownerIncarnation: participant.ownerIncarnation }
+              : {}),
           },
           participant.ownerIdentityId,
           {
@@ -1136,6 +1183,11 @@ export class AgentsProvider implements FabricProvider {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    if (isProviderParticipantRef(id)) {
+      return controlProviderParticipant(
+        this.providerParticipants, this.participants, this.control, id, kind, message, data,
+      ) as Promise<FabricAgentMessageResult>;
+    }
     return this.#router.routeMessage(id, message, data, kind, context, options);
   }
 
@@ -1159,6 +1211,9 @@ export class AgentsProvider implements FabricProvider {
     from: MeshIdentity,
     signal?: AbortSignal,
   ): Promise<FabricControlAcceptance> {
+    if (isProviderParticipantRef(command.targetId)) {
+      return acceptProviderParticipantControl(this.providerParticipants, command);
+    }
     return this.#router.acceptControl(command, from, signal);
   }
 
@@ -1173,14 +1228,18 @@ export class AgentsProvider implements FabricProvider {
     // Also freeze imported templates before any resident host sees the request.
     const extensions = request.extensions ?? true;
     const kernel = this.manager.resolveKernel({ ...request, extensions });
-    const { kernel: _requestedKernel, ...baseRequest } = request;
+    const { kernel: _requestedKernel, principalScope: _forged, ...baseRequest } = request;
+    // Bind the actor to the creating principal; the resident host has no scope of its own.
+    const principalScope = sessionScope();
     request = {
       ...baseRequest,
       runner: request.runner ?? this.manager.config.runner,
       extensions,
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
+      ...(principalScope ? { principalScope } : {}),
     };
     if (request.residency !== "durable") return this.actorManager.create(request);
+    this.#assertUnconfinedDurable();
     if (!this.residency) return this.#residentActorClient().createActor(request);
 
     await this.residency.ensureHost();
@@ -1193,6 +1252,52 @@ export class AgentsProvider implements FabricProvider {
     }
     await this.#activateDurableActor(actor);
     return actor;
+  }
+
+  // The shared resident host cannot inherit this process's write confinement;
+  // scope travels with the request (inheritedScope, principalScope) instead.
+  #assertUnconfinedDurable(): void {
+    if (process.env.PI_FABRIC_WRITE_POLICY) {
+      throw new Error("A write-confined agent cannot start durable agents or actors");
+    }
+  }
+
+  /** seed: "branch" forks the caller's completed turns; "snippet" prefixes recent text. */
+  #applySeed(
+    args: Record<string, unknown>,
+    request: AgentRunRequest,
+    context: FabricInvocationContext,
+  ): AgentRunRequest {
+    const { seed, seedMessages } = checkedSeed(args.seed, args.seedMessages);
+    if (seed === "task") return request;
+    if ((request.runner ?? this.manager.config.runner) !== "pi") {
+      throw new Error(`seed: "${seed}" requires the Pi runner`);
+    }
+    const session = context.extensionContext.sessionManager;
+    const branch = session?.getBranch?.();
+    if (!session || !branch) throw new Error(`seed: "${seed}" requires a Pi session`);
+    if (seed === "snippet") return { ...request, task: snippetTask(branch, seedMessages, request.task) };
+    if (request.residency === "durable") {
+      throw new Error('seed: "branch" is unavailable for durable agents; use seed: "snippet"');
+    }
+    const model = context.extensionContext.model;
+    const sourceSessionFile = session.getSessionFile?.();
+    const thinkingTransfer = request.model
+      ? resolveThinkingTransfer(
+          context.extensionContext,
+          request.model,
+          model ? { provider: model.provider, modelId: model.id } : undefined,
+        )
+      : undefined;
+    return {
+      ...request,
+      forkSeed: {
+        sourceSessionId: session.getSessionId(),
+        ...(sourceSessionFile ? { sourceSessionFile } : {}),
+        sourceBranch: completedBranchPrefix(branch),
+      },
+      ...(thinkingTransfer ? { thinkingTransfer } : {}),
+    };
   }
 
   #residentActorClient(): ResidentActorClient {
@@ -1264,6 +1369,9 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async stopParticipant(id: string): Promise<unknown> {
+    if (isProviderParticipantRef(id)) {
+      return controlProviderParticipant(this.providerParticipants, this.participants, this.control, id, "stop");
+    }
     try {
       const result = await this.manager.stop(id);
       this.participants.scheduleRefresh();
@@ -1292,7 +1400,7 @@ export class AgentsProvider implements FabricProvider {
       participant.ownerHostId,
       participant.id,
       "stop",
-      {},
+      participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {},
       participant.ownerIdentityId,
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);

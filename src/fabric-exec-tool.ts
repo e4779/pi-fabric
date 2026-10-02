@@ -38,7 +38,6 @@ import {
   fabricRepeatBlockText,
   fabricRepeatWarnText,
 } from "./repeat-guard.js";
-import { typeErrorRecoveryHint } from "./type-error-guidance.js";
 import { normalizeRunDisplay } from "./run-display.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { FabricMediaBlock } from "./protocol.js";
@@ -157,7 +156,11 @@ export const createFabricExecTool = (
       // SDK/CLI reload rebuilds the registry before session_start bootstraps
       // the replacement extension. That transient loadout is not a request.
       if (!state.bootstrapped) return undefined;
-      return fabricToolLoadout(loadout, state.config.fullCodeMode || state.config.schema.mode === "enforce");
+      return fabricToolLoadout(
+        loadout,
+        state.config.fullCodeMode || state.config.schema.mode === "enforce",
+        state.foregroundTools(loadout.declared.map((tool) => tool.name)).tools,
+      );
     },
     label: "Fabric",
     description: python
@@ -201,9 +204,9 @@ export const createFabricExecTool = (
       code: Type.String({
         description: python
           ? monty
-            ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
-            : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
-          : "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `cache`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
+            ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
+            : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
+          : "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `cache`, `thinking`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
       }),
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
@@ -974,6 +977,8 @@ export const createFabricExecTool = (
               : error.message,
           )
           .join("\n");
+        // Guidance parses the guest declarations; load it only on a type error.
+        const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
         const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
         const bounded = await boundModelOutput(
           `Type errors; code was not executed:\n${text}${
