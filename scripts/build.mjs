@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 
 const primaryEntryPoints = [
   "src/index.ts",
+  "src/extension-bootstrap.ts",
   "src/memory.ts",
   "src/mcp.ts",
   "src/agents.ts",
@@ -77,6 +78,7 @@ const lazyEntryPoints = [
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
   "src/ui/shell-tasks.ts",
+  "src/ui/image-overlays.ts",
   "src/ui/languages/bend.ts",
   "src/ui/conversation.ts",
   "src/ui/conversation-host.ts",
