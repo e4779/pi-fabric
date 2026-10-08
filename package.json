@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.109.2",
+  "version": "0.109.4",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -173,11 +173,14 @@
     "."
   ],
   "overrides": {
-    "ajv": {
-      "fast-uri": "^3.1.6"
-    }
+    "@modelcontextprotocol/sdk": "1.31.0",
+    "brace-expansion": "5.0.11",
+    "fast-uri": "3.1.7",
+    "nanoid": "3.3.18",
+    "proxy-addr": "2.0.8",
+    "source-map-js": "1.2.2"
   },
   "optionalDependencies": {
-    "jev-fabric": "0.5.0"
+    "jev-fabric": "0.5.1"
   }
 }
