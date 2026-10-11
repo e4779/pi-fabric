@@ -9,7 +9,7 @@ There is no fallback through Pi's normalized `models.classify()` API.
 
 These operations require a native `jev-fabric` exposing both `decisions` and
 `decision-targets`. Fabric checks capabilities, not a guessed version. An old or
-incompatible binary fails clearly; no model request is attempted through a
+incompatible binary fails with an explicit error; no model request is attempted through a
 legacy fallback. Select a rebuilt executable using trusted
 `executor.jevFabric.binary` when developing locally. Automatic resolution keeps
 its existing rule of skipping workspace-supplied binaries.
@@ -121,7 +121,12 @@ Declare `jev.decide` in a program's exact `requires`; the offline methods also
 require their exact refs when used. Legacy `jev.evaluate` and `jev.decide` share
 the program's evaluation/token limits. Zero evaluations prohibit both. Usage is
 accounted even for malformed/refused provider responses; unknown usage blocks
-later inference instead of being treated as free. The final lossless response
+later inference and is never treated as free. A malformed legacy `jev.evaluate`
+answer with valid reported usage is counted and rejected, and later inference
+continues within the remaining budget. A legacy in-process transient HTTP error
+(408, 429, 500, 502, 503, 504 or 529) counts the same way, at the usage its body
+reports or else the request body's UTF-8 bytes as input tokens. `jev.decide`
+keeps its own native accounting: its result status and `budget` decide. The final lossless response
 remains inspectable when its reported tokens exceed the limit. No automatic
 HTTP retries occur.
 
@@ -131,7 +136,7 @@ changed its route semantics. New lossless calls require native transport
 regardless of the legacy `jev.transport` setting.
 
 Decision JSONL frames and complete `jev.decide` results are bounded to **16 MiB
-UTF-8**. Oversized/nonserializable results fail explicitly rather than becoming
+UTF-8**. Oversized/nonserializable results fail explicitly and never become
 `fabricTruncated` objects; other actions retain their normal nested-result caps.
 Audit/UI previews stay bounded. Program input/output, QuickJS memory and final
 model-facing output limits still apply; return a compact projection and keep

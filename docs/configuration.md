@@ -246,7 +246,7 @@ Host ceilings include `maxDurationMs`, `maxEvaluations`, `maxToolCalls`, `maxTok
 ## Lossless decision profiles
 
 `jev.decisionProfiles` is a portable `{version:1, defaultProfile?, profiles}`
-document; global/project precedence replaces it atomically rather than merging
+document; global/project precedence replaces it atomically and never merges
 fields from different providers. `jev.decisionProfile` optionally selects one
 of its names. `null` restores the document default and can clear an inherited
 global selector; an empty or unknown name is invalid.
@@ -329,6 +329,69 @@ Each in-place handoff captures Main's active model at the boundary and restores 
   }
 }
 ```
+
+## Third-party model providers
+
+Fabric selects every model through Pi's model registry and ships no provider list of its own. The same `provider/id` keys work in `agents.model`, `models.aliases` (including fallback chains), `prewalk.model`, `approvals.model`, the `model` argument of `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff`, and the `/fabric settings` model pickers. Any provider that a Pi extension registers with `pi.registerProvider()`, or that Pi's `models.json` defines, works in all of these places once Pi lists it.
+
+Credentials stay with Pi. Fabric hands a child agent only the model key, and the child resolves the credential through Pi as usual: a stored entry in `auth.json` (for example from `/login`), the environment variable the provider names, or the credential store. Fabric never puts keys on a child's command line or in its logs.
+
+With `extensions: false` (per call, or as `agents.extensions`), a Pi child loads none of the user's extensions, so it gets the native tool surface without their tools, commands, or hooks. A model that comes from an extension still resolves. A small Fabric bridge loads the extension that registers the requested provider in an isolated runtime, keeps only that provider registration, and discards every tool, command, flag, renderer, and event handler the extension registered. Fabric first tries extensions whose path names the provider, then the other installed extensions; each tried extension's registration function runs once, and its event handlers never run. Project-local extensions count only in a project that Pi already trusts. Models built into Pi or defined in `models.json` skip the bridge entirely. When no installed extension registers the provider, the child fails before the task is sent, with an error that names the provider and suggests `extensions: true`. Strict model admission is unchanged. This covers both Pi runners (`pi-durable` and `pi`). Provider code that depends on its extension's session hooks, and virtual models routed with `pi.registerVirtualModel()`, still need `extensions: true`. Claude, Veda, and custom runners use their own model catalogs and are unaffected.
+
+### Bundled Coral Bricks provider
+
+Fabric bundles the Coral Bricks provider extension, [`pi-coralbricks-provider`](https://www.npmjs.com/package/pi-coralbricks-provider), so `coralbricks/*` models are available after installing Fabric alone. Disclosure: Fabric's maintainers work at Coral Bricks.
+
+Add a key once, in either form:
+
+```sh
+/login coralbricks                # inside Pi; stores the key in auth.json
+export CORALBRICKS_API_KEY=...    # or in the environment
+```
+
+The provider registers keys such as `coralbricks/glm-5.3-fast` and `coralbricks/deepseek-v4.1-flash-fast`. Without a key it serves the model list shipped in the package and makes no network request. With a key it refreshes that list from Coral's API at session start and after `/login`. It loads as its own entry in Fabric's package (`node_modules/pi-coralbricks-provider/index.ts`), outside Fabric's startup graph, so `extensions: false` children resolve `coralbricks/*` models through the bridge above without loading Fabric's main extension.
+
+You can also install `pi-coralbricks-provider` yourself, for example to pick up a newer release before Fabric bundles it. When both copies load, the newest version registers the provider and the other one stays idle, so `/model` lists each model once.
+
+To leave the bundled provider out, replace the plain `npm:pi-fabric` entry in `~/.pi/agent/settings.json` (or a project's `.pi/settings.json`) with the package object form and exclude its path:
+
+```json
+{
+  "packages": [
+    { "source": "npm:pi-fabric", "extensions": ["!node_modules/pi-coralbricks-provider/**"] }
+  ]
+}
+```
+
+Fabric's own extension keeps loading. Use the same `source` you installed from (`git:github.com/fabric-runtime/pi-fabric` or a local path). After opting out, `coralbricks/*` models resolve only if you install the provider separately, and an `extensions: false` child that asks for one fails before the task is sent.
+
+Use the Coral Bricks keys wherever Fabric takes a model, for example in aliases that mix providers:
+
+```json
+{
+  "models": {
+    "aliases": {
+      "fast": ["coralbricks/deepseek-v4.1-flash-fast", "google/gemini-2.5-flash"],
+      "deep": { "model": "coralbricks/glm-5.3-fast", "thinking": "high" }
+    }
+  }
+}
+```
+
+Alias resolution uses the first target with a credential, so `fast` falls back to Gemini on a machine without a Coral Bricks key. A program can also run the same task on two providers side by side:
+
+```ts
+const task = "Summarize the error handling in src/worker.ts in five bullets.";
+const [coral, gemini] = await Promise.all([
+  agents.run({ model: "coralbricks/deepseek-v4.1-flash-fast", task, extensions: false }),
+  agents.run({ model: "google/gemini-2.5-flash", task, extensions: false }),
+]);
+return { coral: coral.text, gemini: gemini.text };
+```
+
+### Other providers
+
+Every other provider works the same way. Install its Pi extension with `pi install`, or define it in Pi's `models.json`, and its `provider/id` keys work in each place listed at the start of this section, including `extensions: false` children.
 
 ## Result formatting
 
@@ -444,7 +507,7 @@ A compatible exact-name core override is an additive extension of its existing `
 
 ## Approvals and risk
 
-Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Approval policy values are `allow`, `ask`, `auto`, or `deny`. Policies cover actions invoked inside `fabric_exec` and top-level model-requested tools left on Pi's native path. Native calls keep Pi's original implementation, result shape, and renderer. Fabric adds only the supported interception hook that runs before execution.
+Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Approval policy values are `allow`, `ask`, `auto`, or `deny`. Policies cover actions invoked inside `fabric_exec` and top-level model-requested tools left on Pi's native path. Native calls keep Pi's original implementation, result shape, and renderer. Fabric adds only the supported interception hook that runs before execution. The native-path check starts with the session, before Fabric's runtime activates on first use, so the same direct call gets the same answer before and after the first `fabric_exec`. `/fabric settings` and `/fabric reload` are commands, not tool calls, so a restrictive policy can always be changed in-session.
 
 - Captured and directly registered tools default to the conservative `execute` risk because Pi tool definitions do not declare effects. Add exact tool-name overrides under `capture.risks`. Fovea's verified graph-navigation tools (`fovea_sketch`, `fovea_focus`, `fovea_dwell`, and `fovea_impact`) are read-only exceptions that default to `read`.
 - `capture.hideFromModel` and `capture.keepVisible` remain accepted legacy preferences, but cannot override exclusive full-code or Schema enforce mode. Native active tools stay registered/callable while their declarations are hidden.
@@ -531,7 +594,7 @@ Fabric clears inactive run artifacts by age. It never truncates active JSONL fil
 - `retention.oneShotRunMs`: retain terminal one-shot agent run artifacts for 24 hours. An explicit `agents.cleanup()` may remove them sooner. Graceful shutdown with `agents.retainRuns: true` marks managed roots closed; empty roots are removed immediately. `retainRuns: false` requests deletion after child transports stop, including for managed temporary roots. Inherited nested roots belong to the enclosing agent run: a child manager stops its session children but leaves their terminal status and transcripts for that run's cleanup/retention or the root-session shutdown.
 - `retention.actorRunArchiveMs`: retain terminal actor run archives for seven days. Fabric always preserves the latest run for each actor.
 
-Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never applies cache pressure to agent runs or truncates their JSONL/actor `session.jsonl` files. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes all three values under **Retention**. Changing them requires `/fabric reload`.
+Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never applies cache pressure to agent runs or truncates their JSONL/actor `session.jsonl` files. A `pi-durable` run's own `durable/` journal is a known run artifact and expires with its run. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes all three values under **Retention**. Changing them requires `/fabric reload`.
 
 ### Temporary output and reader scratch
 
@@ -560,7 +623,7 @@ Other agent settings:
 - `maxPerExecution`: hard cap on children per `fabric_exec` invocation.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
 - `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (24 hours by default, which is also the policy ceiling). Fabric ignores lower per-call values. The default matches the ceiling on purpose: an orchestration program inherits this value as its own whole-program deadline floor, so a lower default would cut a long participant short well inside the allowed maximum. Lower it to bound a class of runs, and raise a single run with a per-call value.
-- `extensions`: whether Claude children keep their normal Claude Code customizations.
+- `extensions`: whether children load the user's normal extensions (Pi) or Claude Code customizations (Claude). Pi children with `false` keep extension-registered model providers; see [third-party model providers](#third-party-model-providers).
 - `defaultTools`: the default tool allowlist for children.
 - `budgetUsd`: shared append-only cost ledger across a recursion tree (0 disables).
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).

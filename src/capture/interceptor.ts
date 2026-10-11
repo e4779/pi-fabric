@@ -39,6 +39,14 @@ export interface RegisteredToolCaptureOptions {
 }
 
 const HUB_SYMBOL = Symbol.for("pi-fabric.registered-tool-capture.v1");
+// A process that hosts Pi sessions on a private SDK copy (the pi-durable worker
+// resolves the pinned `pi-fabric-worker-sdk` alias) advertises that copy's
+// ExtensionRunner under this process-local key; see src/durable/worker-host.ts.
+// PI_PACKAGE_DIR, argv[1], and the entry realm cannot locate an aliased
+// dependency, and in hoisted or npm layouts the peer copy they do find is a
+// distinct class identity: patching only that dead class leaves the catalog
+// runner unset, so nested mutating pi.* calls fail closed.
+const HOST_RUNNERS_SYMBOL = Symbol.for("pi-fabric.host-extension-runners.v1");
 const ANCHOR_SYMBOL = Symbol.for("pi-fabric.registered-tool-anchor.v1");
 
 const definitionDelegatesTo = (
@@ -196,24 +204,73 @@ const entryRealmPackageRoot = (): string | undefined => {
   return undefined;
 };
 
+const realPath = (file: string): string => {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+};
+
+const isWithin = (directory: string, file: string): boolean => {
+  const relative = path.relative(directory, file);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+};
+
+const exportedExtensionRunner = async (entry: string): Promise<ExtensionRunnerConstructor[]> => {
+  try {
+    const module = (await import(pathToFileURL(entry).href)) as { ExtensionRunner?: unknown };
+    return isExtensionRunnerConstructor(module.ExtensionRunner) ? [module.ExtensionRunner] : [];
+  } catch {
+    return []; // Entry not importable in this realm; skip it.
+  }
+};
+
+// One Pi package ships two SDK copies with distinct ExtensionRunner identities:
+// the unbundled dist/index.js graph and the dist/bundle chunks behind the
+// published `pi` bin. Patch only the copy the running CLI evaluated. In the
+// bundled CLI, importing dist/index.js evaluated a second, unbundled SDK for a
+// class no live runner uses: hundreds of modules, each serialized to the
+// compile cache that CLI enables, on every Fabric startup and exit. The
+// bundle's SDK entry shares the chunks that CLI already evaluated, so it is a
+// module-cache hit. An unbundled CLI never evaluates the bundle's chunks, so
+// scanning them only loaded dead classes. Any other entry (embeds, wrappers
+// that set PI_PACKAGE_DIR) may use either copy.
+const packageExtensionRunnerConstructors = async (
+  packageRoot: string,
+  entry: string | undefined,
+): Promise<ExtensionRunnerConstructor[]> => {
+  const distDirectory = path.join(packageRoot, "dist");
+  const bundleDirectory = path.join(distDirectory, "bundle");
+  if (entry && isWithin(bundleDirectory, entry)) {
+    const bundled = await exportedExtensionRunner(path.join(bundleDirectory, "index.js"));
+    // Bundles without an SDK entry export the class from a chunk only.
+    return bundled.length > 0 ? bundled : bundleExtensionRunnerConstructors(bundleDirectory);
+  }
+  const unbundled = await exportedExtensionRunner(path.join(distDirectory, "index.js"));
+  if (entry && isWithin(distDirectory, entry)) return unbundled;
+  return [...unbundled, ...(await bundleExtensionRunnerConstructors(bundleDirectory))];
+};
+
 const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
   const constructors = new Set<ExtensionRunnerConstructor>();
+  const advertised = (globalThis as Record<PropertyKey, unknown>)[HOST_RUNNERS_SYMBOL];
+  for (const Runner of advertised instanceof Set ? advertised : []) {
+    if (isExtensionRunnerConstructor(Runner)) constructors.add(Runner);
+  }
+  // A host that advertises its runner runs every session in this process on
+  // that SDK copy. The copies found by path are dead classes there; importing
+  // them evaluated the peer package's unbundled SDK and every chunk of its
+  // bundle in each durable worker.
+  if (constructors.size > 0) return [...constructors];
   const packageRoots = new Set(
-    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()].filter(
-      (root): root is string => typeof root === "string" && Boolean(root),
-    ),
+    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()]
+      .filter((root): root is string => typeof root === "string" && Boolean(root))
+      .map(realPath),
   );
+  const entry = process.argv[1] ? realPath(process.argv[1]) : undefined;
   for (const packageRoot of packageRoots) {
-    try {
-      const hostEntry = path.join(packageRoot, "dist", "index.js");
-      const hostModule = (await import(pathToFileURL(hostEntry).href)) as {
-        ExtensionRunner?: ExtensionRunnerConstructor;
-      };
-      if (hostModule.ExtensionRunner) constructors.add(hostModule.ExtensionRunner);
-    } catch { /* host entry not importable; skip */ }
-    for (const Runner of await bundleExtensionRunnerConstructors(
-      path.join(packageRoot, "dist", "bundle"),
-    )) {
+    for (const Runner of await packageExtensionRunnerConstructors(packageRoot, entry)) {
       constructors.add(Runner);
     }
   }
