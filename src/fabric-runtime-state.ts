@@ -1,5 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { loadHostSdk } from "./core/host-sdk.js";
+import { requestChildTraceContext } from "./agents/trace-context-request.js";
 import {
   resolveAvailablePiModel,
   type FabricModelCandidate,
@@ -131,6 +133,7 @@ import {
 } from "./protocol.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
+import { PeerPresenceNotifier } from "./topology/peer-presence.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
 import { readFabricBashMiddleware } from "./core/shell-middleware.js";
@@ -190,6 +193,7 @@ export class FabricRuntimeState {
   #speculation: RuntimeStateSpeculation | undefined;
   #agents: AgentManager | undefined;
   #completionInbox: AgentCompletionInbox | undefined;
+  #peerPresence: PeerPresenceNotifier | undefined;
   #shellInbox: ShellEventInbox | undefined;
   #shellTiming: FabricShellTimingBridge | undefined;
   #actors: ActorDirectory | undefined;
@@ -717,7 +721,7 @@ export class FabricRuntimeState {
         const { model } = resolveParticipantPiModel(modelKey);
         // Load host settings only for an actual compacted handoff. Project
         // trust does not transfer implicitly to a different working directory.
-        const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+        const { SettingsManager } = await loadHostSdk();
         const settings = SettingsManager.create(cwd, resolveAgentDir(), {
           projectTrusted: !this.#managedHost && cwd === context.cwd && context.isProjectTrusted(),
         }).getCompactionSettings(model);
@@ -742,6 +746,8 @@ export class FabricRuntimeState {
       onResultConsumed: (id) => completionInbox.acknowledge(id),
       onChildQuestion: (request) =>
         routeChildQuestion(request, { context, ...(this.#decisions ? { store: this.#decisions } : {}) }),
+      resolveChildTraceContext: (launch) =>
+        requestChildTraceContext((event, value) => this.pi.events?.emit(event, value), launch),
     });
     const canManageActor = (actorId: string): boolean | undefined => {
       const participant = this.#participants?.get(actorId);
@@ -931,6 +937,14 @@ export class FabricRuntimeState {
         );
       }
     }
+    // Children are coordinated by their parent; only a root is told about peers.
+    if (mainAgent.local && this.#config.mesh.enabled) {
+      this.#peerPresence = new PeerPresenceNotifier(this.pi, context, {
+        peers: () => this.peerInfos(),
+        enabled: () => this.#config?.mesh.peerNotices === true,
+        cwd: context.cwd,
+      });
+    }
     this.#lifecycle.start();
     this.#residency?.start();
     await builtins.install(createProviderComponent({
@@ -954,7 +968,7 @@ export class FabricRuntimeState {
             }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn });
           }) : undefined;
           this.#jevObservationHost = observationHost;
-          // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.
+          // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, `typesafe-ai/...` uses Vercel AI Gateway, and `subq-...` uses SubQ.
           const jevRoute = resolveJevModelRoute(this.#config!.jev.model).route;
           const provider = new JevProvider({
             registry: this.#registry!, config: this.#config!, observationHost,
@@ -1445,6 +1459,8 @@ export class FabricRuntimeState {
   async shutdown(): Promise<void> {
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
+    this.#peerPresence?.close();
+    this.#peerPresence = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
     this.#shellTiming?.close();

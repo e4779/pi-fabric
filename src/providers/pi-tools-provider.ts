@@ -1,20 +1,13 @@
 import { readFileSync } from "node:fs";
 import { nativeToolResult } from "../core/native-tool-result.js";
 import path from "node:path";
-import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
-import {
-  createBashToolDefinition,
-  createEditToolDefinition,
-  createFindToolDefinition,
-  createGrepToolDefinition,
-  createLocalBashOperations,
-  createLsToolDefinition,
-  createReadToolDefinition,
-  type AgentToolResult,
-  type ExtensionContext,
-  type ExtensionRunner,
-  type ToolDefinition,
+import type {
+  AgentToolResult,
+  ExtensionContext,
+  ExtensionRunner,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { PiCodingAgent } from "../core/host-sdk-runtime.js";
 import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
@@ -292,14 +285,14 @@ export class PiToolsProvider implements FabricProvider {
       ? new PowerShellCwdDefinitions(powerShellFactory)
       : undefined;
     this.#tools = this.#requireCapturedOverrides ? {} : {
-      read: createReadToolDefinition(cwd),
-      bash: createBashToolDefinition(cwd),
+      read: PiCodingAgent.createReadToolDefinition(cwd),
+      bash: PiCodingAgent.createBashToolDefinition(cwd),
       ...(powerShellFactory ? { powershell: powerShellFactory(cwd) } : {}),
-      edit: createEditToolDefinition(cwd),
+      edit: PiCodingAgent.createEditToolDefinition(cwd),
       write: createPreviewWriteToolDefinition(cwd),
-      grep: createGrepToolDefinition(cwd),
-      find: createFindToolDefinition(cwd),
-      ls: createLsToolDefinition(cwd),
+      grep: PiCodingAgent.createGrepToolDefinition(cwd),
+      find: PiCodingAgent.createFindToolDefinition(cwd),
+      ls: PiCodingAgent.createLsToolDefinition(cwd),
     };
     this.#catalog = catalog;
     this.#capturedTools = capturedTools;
@@ -490,12 +483,12 @@ export class PiToolsProvider implements FabricProvider {
             command: typeof args.command === "string" ? args.command : "", cwd, ownerId: job.options.ownerId,
             notify,
           })
-        : createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+        : PiCodingAgent.createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
       const operations = middleware ? middleware.wrapOperations(local) : local;
       if (!operations || typeof operations.exec !== "function") {
         throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
       }
-      return createBashToolDefinition(cwd, {
+      return PiCodingAgent.createBashToolDefinition(cwd, {
         ...options,
         operations: trackShellOperations(operations, job, "bash"),
       });
@@ -599,14 +592,19 @@ export class PiToolsProvider implements FabricProvider {
     const logPath = await job.persistLog();
     const pid = await job.readPid();
     const elapsedMs = Date.now() - job.startedAt;
+    // A short command can end before this hand-off returns: say so.
+    const exited = job.finished ? { exitCode: job.exitCode ?? null } : undefined;
     const notice = formatShellHangNotice({
       elapsedMs,
       logPath,
       ...(pid !== undefined ? { pid } : {}),
+      ...exited,
     });
     const durableNotice = job.durable ? ` Durable: owned by the jev-fabric store at ${job.durable.home}; it keeps running if Pi exits and reattaches to this session on resume. Stop it explicitly with tasks.stop when no longer needed.` : "";
     const output = appendShellHangNotice(job.snapshotText(), `${notice}\n[Task ${job.id}; /fabric tasks or tools.call({ref:"tasks.get",args:{id:"${job.id}"}}). ${monitor?.delivery === "ui" ? "UI-only monitor: will not wake the agent." : "Completion will notify this session; do not poll."}${durableNotice}]`);
-    context.update(`${name}: still running after ${Math.max(1, Math.round(elapsedMs / 1000))}s`);
+    context.update(exited
+      ? `${name}: ${exited.exitCode === null ? "ended" : `exited with code ${exited.exitCode}`} in the background`
+      : `${name}: still running after ${Math.max(1, Math.round(elapsedMs / 1000))}s`);
     return {
       content: [{ type: "text", text: output }],
       details: {
@@ -731,6 +729,7 @@ export class PiToolsProvider implements FabricProvider {
       type: "tool_call",
       toolName: name,
       toolCallId: context.nestedToolCallId,
+      parentToolCallId: context.parentToolCallId,
       input: args,
     }));
     context.updateArguments?.(args);
@@ -757,9 +756,13 @@ export class PiToolsProvider implements FabricProvider {
     preflightEmitted = false,
   ): Promise<unknown> {
     const toolCallId = context.nestedToolCallId;
+    // Pi's own nested calls name their caller on every event; so do these replays,
+    // so a listener can tell which of several open fabric_exec calls issued one.
+    const parentToolCallId = context.parentToolCallId;
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_start",
       toolCallId,
+      parentToolCallId,
       toolName: name,
       args,
     }));
@@ -783,6 +786,7 @@ export class PiToolsProvider implements FabricProvider {
               runAbortable(context.signal, () => runner.emit({
                 type: "tool_execution_update",
                 toolCallId,
+                parentToolCallId,
                 toolName: name,
                 args,
                 partialResult,
@@ -817,6 +821,7 @@ export class PiToolsProvider implements FabricProvider {
       type: "tool_result",
       toolName: name,
       toolCallId,
+      parentToolCallId,
       input: args,
       content: result.content,
       details: result.details,
@@ -844,6 +849,7 @@ export class PiToolsProvider implements FabricProvider {
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_end",
       toolCallId,
+      parentToolCallId,
       toolName: name,
       result,
       isError,
