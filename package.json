@@ -126,7 +126,7 @@
 	"author": "monotykamary",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/fabric-runtime/pi-fabric.git"
+		"url": "git+https://github.com/e4779/pi-fabric.git"
 	},
 	"homepage": "https://github.com/fabric-runtime/pi-fabric#readme",
 	"bugs": {
