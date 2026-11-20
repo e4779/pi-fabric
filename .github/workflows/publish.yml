@@ -109,6 +109,6 @@ jobs:
             elif npm view "$spec" version >/dev/null 2>&1; then
               echo "$spec is already on npm"
             else
-              npm publish "$tarball" --access public --provenance
+              npm publish "$tarball" --access public --provenance --tag latest
             fi
           done
